@@ -1,0 +1,230 @@
+\documentclass[12pt]{article}
+\usepackage{geometry}                % See geometry.pdf to learn the layout options. There are lots.
+\geometry{letterpaper}                   % ... or a4paper or a5paper or ... 
+\usepackage[parfill]{parskip}    % Activate to begin paragraphs with an empty line rather than an indent
+\usepackage{graphicx}
+\usepackage{amssymb, amsmath}
+\usepackage{fullpage}
+
+\usepackage{fourier}
+\usepackage{courier}
+
+\setcounter{secnumdepth}{0} % supresss section numbers
+
+\title{Aggregation Optimizations}
+\author{Josh Rosen}
+
+\begin{document}
+\maketitle
+
+Distributed group-by-key aggregations are an important type of query that's worth optimizing.
+Examples of these sorts of queries include the classic MapReduce word-count and message-combining in Pregel.
+
+In distributed engines like MapReduce, these queries can be executed by hash-repartitioning the dataset by its grouping attribute(s), then using a hash-table to compute the aggregates for each group given all of its values.
+% TODO: do multiple grouping attributes introduce anything interesting into this scheme?
+
+This can be optimized using \emph{preaggregation}, where the aggregation is performed in two phases: first, the subset of a key's values on a particular machine are aggregated into a single value; next, these aggregates are hash-repartitioned and a final aggregation is performed on each group.
+This corresponds to Hadoop's ``Combiners'' feature.
+For this optimization to apply, the aggregation function has to be commutative and associative.
+% TODO: is this strictly true, or can we use a more-precise or weaker set of properties?
+% TODO: cite TAG.
+
+Preaggregation can improve performance by reducing the volume of data set over the network and by distributing the CPU cost of applying the aggregation function to popular keys.
+These benefits come at the cost of additional hash lookups and memory usage during the pre-shuffle phase.
+
+\subsection{Preaggregation and Skew}
+
+Skew can affect preaggregation's cost and benefit.  Key-value pairs can exhibit both input and output skew \cite{adaptive-aggregation}.
+With \emph{input skew}, all nodes have the same number of groups but different numbers of records.  Input skew can cause a particular node to become a straggler because it has more input data to process.  In contrast, with \emph{output skew}, nodes have the same number of records but different numbers of groups or distinct keys, which means that some nodes may not have enough buffer space to preaggregate all groups.
+
+\subsection{Partial Preaggregation}
+
+So far, we've considered preaggregation to be an ``all-or-nothing'' optimization that treats all groups similarly.
+\emph{Partial preaggregation} \cite{partial-preaggregation} is a middle-ground where multiple values for a group may be emitted during the pre-shuffle phase.  For example, 100 values sharing a particular key might be aggregated into two values instead of one.
+This works because the two-phase aggregation strategy still needs to perform a final aggregation, so the ``partial'' preaggregates will be combined during the final aggregation.
+
+Partial preaggregation overcomes limitations on buffer space for holding the pre-shuffle grouping hash table.
+While sequentially scanning through records, values can be aggregated into matching entries in the hashtable or inserted as new entries.
+When the hashtable becomes full, partial preaggregation algorithms employ an \emph{eviction strategy} to free up space.
+The simplest eviction strategies are to evict a randomly-chosen key or to evict all keys.
+Values can be evicted by spooling them to disk or by sending them over the network to the node that performs the final aggregation for those keys.
+
+This is exactly analagous to cache eviction policies, where we want to maximize cache hits (preaggregations), and algorithms like LRU or LFU can be used.
+The optimal eviction strategy is to evict the key that will be hit furthest in the future; it's not possible to actually implement this strategy, but it provides an upper bound on the effectiveness of our eviction strategy.
+% TODO: cite
+
+% TODO: what about lookahead or other secondary buffering techniques?
+
+%Partial preaggregation, \cite{partial-preaggregation} assumes that input records arrive in a random order (i.e. their groups are randomly sampled from some (possibly-skewed) distribution).
+
+\subsection{When to Apply Preaggregation}
+
+To decide whether to apply complete preaggregation or perform a shuffle of the entire dataset, we can calculate the total number of groups being aggregated, since preaggregation is beneficial when there are relatively few keys, but may harm performance on data sets with huge numbers of unique or infrequent keys \cite{adaptive-aggregation}.
+Sampling techniques can be used to estimate the number of groups.
+Some systems pick an initial aggregation strategy and adaptively change it if the original cost estimates appear to be wrong (e.g. by having nodes autonomously switch from complete pre-aggregation to direct shuffling of tuples if they do not have enough buffer space for the pre-aggregation hashtable) \cite{adaptive-aggregation}.
+
+Partial pre-aggregation is a little trickier because it's sensitive to input orderings.  If the input is perfectly clustered by the grouping attributes, then pre-aggregation requires one partial results' worth of buffer space to achieve the maximum reduction in output size.  Knowing the exact distribution of values across groups doesn't help here, since an adversarial input ordering can lead to high eviction rates.
+
+% TODO: What about multi-phase partial sorting for aggregation?
+\section{Optimal Allocation of Buffer Space}
+There are several tasks to which we can allocate buffer space, including the pre- and post-shuffle hash tables; we can also use buffer space to implement a limited form of ``lookahead'' by dynamically re-ordering arriving tuples before probing the hashtable.  For this analysis, assume that all machines participate in both the pre- and post-shuffle phases.
+
+% Aside: Belady's anomaly shows that increasing buffer space doesn't always improve hit rates / reduce faults under a FIFO replacement policy.  This anomaly doesn't apply to LRU or the optimal replacement policy.  It's worth considering whether the non-optimal heuristics we'll use can suffer from this anomaly.
+
+\subsection{Buffering for Lookahead}
+
+We might consider using a small amount of buffer space to implement ``lookahead'' against the preaggregation hash table.
+Does this ever make sense?
+Disk drives use a similar idea to serve requests out-of-order to reduce seeks or rotational delays.
+Similarly, sorting can reduce cache misses.
+
+With both disks and processor caches, the cost of a ``miss'' is extremely high, yet caches are very expensive so a sort buffer may make sense.
+% TODO ... but that's not necessarily the case here because ...
+% game out the possibilities as a matrix of outcomes
+
+The trade-off here is one record of additional lookahead versus one hashtable slot, plus the CPU overheads of sorting or otherwise managing the lookahead buffer.
+
+There may be related work in compression literature, since sorting (clustering) reduces the entropy in a dataset and improves its compressibility.
+
+In web caching, people have investigated request reordering approaches where incoming requests can be served out of order \cite{web-caching-new-results}.  In that context, we're concerned with not delaying requests for too long.  This notion of ``too long'' seems to be measured in terms of requests, such that the oldest re-ordered request arrivied at most $r$ requests ago.  The general version of this re-ordering problem is NP-hard (why?).  There are different models for how much space documents take in the cache and the cost of cache misses.  The simplest model, corresponding to our hash-table sizing problem, is the Uniform Model, where all documents have the same size and carry the same cache miss penalty.
+
+The reordering buffer management problem \cite{online-scheduling-for-sorting-buffers} considers requests arriving at a service provider that can benefit from contiguous runs of requests for the same item.  The service provider can buffer a finite number of requests and must evict a buffered request for each incoming request.  The goal is to minimize the number of ``context switches'' that the service provider performs by switching the type of item that it's processing.
+
+A generalization of this proble, the \emph{multi service sorting buffer} problem, has a set of idential service providers.  If requests can't be buffered, this reduces to the classic \emph{paging problem}.  The \emph{queue sorting buffer} problem is another variant where incoming items are appended to queues with fixed space and the service provider must process the head of one of the queues (akin to mergesort).
+
+More generally, our problem appears to be a type of \emph{sorting buffer} or \emph{reordering buffer} problem.
+
+Aha, so the problem that I'm trying to solve is NP-hard since it's the \emph{generalized sorting buffer problem} \cite{sorting-buffer-np-hardness}.
+Longest Forward Distance is the optimal offline algorithm for the paging problem \cite{lfd}, but it's not a constant approximation for the sorting buffer problem \cite{sorting-buffer-np-hardness}:
+
+The paper \cite{competitive-reordering-algorithm} considers...
+
+% TODO: have these strategies been explored in disk-spilling hashtables?
+
+
+\subsection{Selective Bypassing}
+It may be worth investigating work on \emph{caching with bypassing}.  In many caching scenarios, like memory paging in operating systems, there's no option but to evict from the cache.  Our problem of deciding whether to evict a key or directly forward an input tuple is exactly analgous to the problem of caching with bypassing.
+
+Again, we're faced with a trade-off: if we maintain a list of records with poor hit ratios, the space used to maintain that list could also be used to have a bigger cache.  In processors, you can classify individual instructions in a loop as ``tends to cause cache misses`` (or hits), so you only need a small dense array to track hit rate information \cite{automatic-cache-bypass}.
+
+% TODO: a large portion of the literature here seems to be in patents.
+
+% It looks like a relevant search term is "adaptive cache manamgement strategies"
+
+% TODO: parallelism: can you pipeline this process, having one thread sort pages of records at a time while another thread consumes sorted pages and probes the hashtable?
+
+% TODO: what about associativity?
+
+\section{Evicting to Local vs. Remote Disk}
+
+\section{Breaking Ties When Choosing Victims}
+
+Maybe we could break ties when choosing victims by preferring victims that have been recently evicted (a sort of ``poor get poorer'' approach).
+
+\pagebreak
+\section{Analysis}
+
+\subsection{Payoffs in terms of data properties}
+
+\subsection{Characterization of optimal and default strategies}
+
+\subsection{Permutations of local data}
+
+Consider a data set of $n$ key-value pairs, with $k$ distinct keys.
+
+Assume that keys are drawn from a Zipf distribution with parameter $\alpha$.
+Using complete pre-aggregation on data drawn from this distribution, what's the best-case reduction of tuples in the input to the final aggregation phase?
+For large values of $\alpha$, the keys are sampled uniformly, so each key appears roughly $n/k$ times and complete pre-aggregation reduces the final reducer's input by a factor of $n/k$.
+At the other extreme, a small $\alpha$ produces a handful of popular keys and a long tail of unique or infrequent keys.
+
+Actually, complete pre-aggregation always reduces the size by a factor of $n/k$, since we output exactly one tuple for each of the $k$ keys.
+
+%To be precise, if key $i$ appears with frequency $d_i$, then complete pre-aggregation outputs exactly $k$ tuples, one per key, saving
+%\[
+%    \sum_{i=1}^k \min \left(d_i - 1, 0\right) = 
+%\]
+
+If we draw keys from this Zipf distribution, what's the expected number of unique keys that are assigned to each of $m$ machines?
+\begin{align*}
+    E[X|\alpha] &= \sum_{k=1}^K E[I(k, d_k) | \alpha]
+\\              &= \sum_{k=1}^K \sum_{d=1}^K \left(1 - \left(1 - 1/m\right)^d\right)p(d | \alpha)
+\\              &= k \sum_{k=1}^K\left(1 - p\left(\text{all copies of $k$ are assigned to other machines}\right)\right) p(d | \alpha)
+\end{align*}
+
+What's the maximum number of unique keys that could be assigned to one machine?  In principle, all keys could appear on one machine, so we'll look at the distribution of the maximum number of keys per machine.
+
+\section{Performance Metrics}
+
+\subsection{Network utilization}
+
+\subsection{Latency}
+
+\subsection{Throughput}
+
+\pagebreak
+\section{Tricks}
+
+\subsection{Affinity Routing}
+
+\subsection{Multi-level aggregation with eviction and skip levels}
+
+\subsection{Sketching for frequent values}
+
+\section{Buffer allocation trade-offs}
+
+\section{Why not sorting?}
+
+\section{Problem Statement}
+Hypothesis: some keys benefit from pre-aggregation while others should not be pre-aggregated.
+
+\section{Optimal Aggregation Strategies}
+
+\section{Skew}
+
+\cite{adaptive-aggregation} distinguishes between two sources of skew.
+With \emph{input skew}, all nodes have the same number of groups but different numbers of records.  Input skew can cause a particular node to become a straggler because it has more input data to process.  In contrast, with \emph{output skew}, nodes have the same number of records but different numbers of groups.  If one node's input data has a huge number of distinct values [...] FIXME.
+
+\section{Adaptivity}
+
+The optimal aggregation strategy depends on the number of groups and their
+distribution across nodes.
+For example, it only makes sense to use Combiners in MapReduce when the number of groups is small.
+Using global statistics, we could try to estimate the number of groups to decide whether to use combiners.
+Alternatively, we can use adaptive aggregation algorithms that allow individual nodes to pick their aggregation strategies based on the properties of their local input data \cite{adaptive-aggregation}.
+
+\section{Order Sensitivity}
+Preaggregation techniques are sensitive to the arrival order of tuples.  With partial preaggregation, for example, the output size may be minimal if the tuples arrive in sorted order, but can be much larger with other orderings \cite{partial-preaggregation}.
+
+When analyzing the expected output reduction due to partial preaggregation, \cite{partial-preaggregation} assumes that input records arrive in a random order (i.e. their groups are randomly sampled from some (possibly-skewed) distribution).
+
+Fully-sorted input will achieve optimal aggregation performance, but partially-sorted orders are still interesting to analyze.  Often, real-world data exhibits temporal clustering; for example, interaction data from a single user's shopping session is likely to be close together in a clickstream log.  To analyze these cases, \cite{estimating-cardinality} introduces a \emph{clusteredness} measurement and explores its impact on the performance of partial preaggregation algorithms.  The clusteredness metric considers only the clustering of input groups and not their relative sort orderings.
+
+\subsection{Clusteredness}
+
+Find the positions where the group changes.  Add these up and exclude the first appearance of each group.  Then, perfectly clustered data has zero changes.  By itself, this is an insufficient measure of clusteredness because it doesn't consider \emph{which} groups we're changing between (e.g. cycling between a few groups vs. changing uniformly at random).  So, we extend this to incorporate the average number of changes until members of the same group are seen.  In short, the clusteredness ``expresses the average number of changes between the appearance of two identical grouping values.''  A clusteredeness of $d$ means that, on average, $d$ group changes will occur until a group is re-encountered.
+
+
+\textbf{Distance classes:} distances between appearances may have high variance, so we replace a single average $d$ with a set of average distances over different ranges (this is like creating a histogram using more bins).
+
+\textbf{Group classes:} ???
+
+The paper doesn't explore how to efficiently compute the clusteredness, so I'm doubtful of this technique's usefulness in practice.
+
+% TODO
+\textbf{Question}: what's the actual clusteredness of real data sets?  Can we compute this and just report some empirical results, since these would establish more realistic bounds for real problem instances?
+
+\subsection{Bounds}
+
+\cite{estimating-cardinality}
+Randomized replacement represents an upper bound on the output size; eviction using lookahead gives a lower bound, even though it's impossible to implement in practice.
+
+\section{Aggregation in graphs}
+
+% TODO: Is there any relationship between aggregation strategies and graph partitioning algorithms?  How do systems like GraphLab actually implement dynamic partitioning given that the space needed to store the "hash" function can be quite large?
+% Is there a good sort of hybrid data structure for compressing those representations?
+
+
+\bibliographystyle{plain}
+\bibliography{aggregation}
+
+\end{document}
