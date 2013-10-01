@@ -122,6 +122,38 @@ Again, we're faced with a trade-off: if we maintain a list of records with poor 
 Maybe we could break ties when choosing victims by preferring victims that have been recently evicted (a sort of ``poor get poorer'' approach).
 
 \pagebreak
+\section{Optimizations for Skewed Data}
+
+\cite{perf-eval-heavy-tail} describes several applications in networking, load-balancing, and scheduling where awareness of skewed data distribution enables optimizations.
+
+\subsection{Machine Learning}
+
+Skew in machine learning: skew can cause problems for classification tasks.
+For example, in fraud detection systems, most transactions are not
+fraudulent, so a naive algorithm that always says ``not fraudulent'' will be
+correct most of the time
+(http://dl.acm.org/citation.cfm?id=1007730.1007738).  In practice,
+techniques can be used to address the imbalance in the underlying data, such
+as performing biased sampling so the fraudulent training examples will be
+weighted more heavily.
+
+\subsection{Join Queries}
+
+https://cwiki.apache.org/confluence/display/Hive/Skewed+Join+Optimization
+suggests a scheme where "broadcast join" can be performed on a per-key basis
+in order to mitigate certain types of skew.  See:
+https://issues.apache.org/jira/browse/HIVE-3086
+% Slides: https://cwiki.apache.org/confluence/download/attachments/27362054/Hive+Summit+2011-join.pdf?version=1&modificationDate=1309986642000
+
+ http://dl.acm.org/citation.cfm?id=319072 is earlier academic work that does
+ something similar, identifying he most frequent keys and assigning them to
+ more processors.
+
+ Skew Handling Techniques in Sort-Merge Joins: http://www.cs.arizona.edu/people/dgao/pub/skew.pdf
+
+In the AQP survey framework, this is an adaptive technique that's based on \emph{horizontal partitioning}, picking different traditional query plans for disjoint portions of the query's data.
+
+\pagebreak
 \section{Analysis}
 
 \subsection{Payoffs in terms of data properties}
@@ -161,6 +193,7 @@ What's the maximum number of unique keys that could be assigned to one machine? 
 
 \subsection{Throughput}
 
+
 \pagebreak
 \section{Tricks}
 
@@ -170,19 +203,6 @@ What's the maximum number of unique keys that could be assigned to one machine? 
 
 \subsection{Sketching for frequent values}
 
-\section{Buffer allocation trade-offs}
-
-\section{Why not sorting?}
-
-\section{Problem Statement}
-Hypothesis: some keys benefit from pre-aggregation while others should not be pre-aggregated.
-
-\section{Optimal Aggregation Strategies}
-
-\section{Skew}
-
-\cite{adaptive-aggregation} distinguishes between two sources of skew.
-With \emph{input skew}, all nodes have the same number of groups but different numbers of records.  Input skew can cause a particular node to become a straggler because it has more input data to process.  In contrast, with \emph{output skew}, nodes have the same number of records but different numbers of groups.  If one node's input data has a huge number of distinct values [...] FIXME.
 
 \section{Adaptivity}
 
@@ -191,6 +211,8 @@ distribution across nodes.
 For example, it only makes sense to use Combiners in MapReduce when the number of groups is small.
 Using global statistics, we could try to estimate the number of groups to decide whether to use combiners.
 Alternatively, we can use adaptive aggregation algorithms that allow individual nodes to pick their aggregation strategies based on the properties of their local input data \cite{adaptive-aggregation}.
+
+% TODO: borrowing from other AQP work, maybe we could use only a sample of the input stream to maintain hit rate statistics.
 
 \section{Order Sensitivity}
 Preaggregation techniques are sensitive to the arrival order of tuples.  With partial preaggregation, for example, the output size may be minimal if the tuples arrive in sorted order, but can be much larger with other orderings \cite{partial-preaggregation}.
