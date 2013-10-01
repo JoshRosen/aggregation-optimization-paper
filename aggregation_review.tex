@@ -17,19 +17,31 @@
 \begin{document}
 \maketitle
 
-Distributed group-by-key aggregations are an important type of query that's worth optimizing.
-Examples of these sorts of queries include the classic MapReduce word-count and message-combining in Pregel.
+\section{Introduction}
+
+Aggregate-by-key is a common and often expensive operation in ``big data'' frameworks like MapReduce and Spark.
+
+There are many techniques to optimize these aggregations, including hierarchical aggregation techniques, such as aggregation trees, and pre-aggregation techniques, like Hadoop and Spark's map-side combiners.
+The aggregation operator's performance is sensitive to skew in its input data properties, such as uneven frequencies of aggregation keys or an uneven partitioning of the keyspace across machines.
+Its performance can also be order-sensitive; for example, pre-aggregation schemes benefit from ``clusteredness'' in their input data, where values with the same key tend to appear close together in the stream.
+
+All of these optimizations involve trade-offs between latency, memory, network usage, and processor time, so the optimal aggregation technique is a function of the data properties and these resources' relative costs.
+It's also interesting to consider how adaptive query processing techniques might be applied to aggregation in a streaming setting.
+
+The rest of this report summarizes related work in aggregation optimization, proposes some new optimizations, and explores issues related to aggregation and lineage-based fault-tolerance.
+
+\section{Pre-aggregation}
 
 In distributed engines like MapReduce, these queries can be executed by hash-repartitioning the dataset by its grouping attribute(s), then using a hash-table to compute the aggregates for each group given all of its values.
 % TODO: do multiple grouping attributes introduce anything interesting into this scheme?
 
-This can be optimized using \emph{preaggregation}, where the aggregation is performed in two phases: first, the subset of a key's values on a particular machine are aggregated into a single value; next, these aggregates are hash-repartitioned and a final aggregation is performed on each group.
+This can be optimized using \emph{prea-ggregation}, where the aggregation is performed in two phases: first, the subset of a key's values on a particular machine are aggregated into a single value; next, these aggregates are hash-repartitioned and a final aggregation is performed on each group.
 This corresponds to Hadoop's ``Combiners'' feature.
 For this optimization to apply, the aggregation function has to be commutative and associative.
 % TODO: is this strictly true, or can we use a more-precise or weaker set of properties?
 % TODO: cite TAG.
 
-Preaggregation can improve performance by reducing the volume of data set over the network and by distributing the CPU cost of applying the aggregation function to popular keys.
+Pre-aggregation can improve performance by reducing the volume of data set over the network and by distributing the CPU cost of applying the aggregation function to popular keys.
 These benefits come at the cost of additional hash lookups and memory usage during the pre-shuffle phase.
 
 \subsection{Preaggregation and Skew}
@@ -66,7 +78,9 @@ Some systems pick an initial aggregation strategy and adaptively change it if th
 Partial pre-aggregation is a little trickier because it's sensitive to input orderings.  If the input is perfectly clustered by the grouping attributes, then pre-aggregation requires one partial results' worth of buffer space to achieve the maximum reduction in output size.  Knowing the exact distribution of values across groups doesn't help here, since an adversarial input ordering can lead to high eviction rates.
 
 % TODO: What about multi-phase partial sorting for aggregation?
-\section{Optimal Allocation of Buffer Space}
+\section{Additional Optimizations for Pre-aggregation}
+
+\subsection{Allocation of Buffer Space}
 There are several tasks to which we can allocate buffer space, including the pre- and post-shuffle hash tables; we can also use buffer space to implement a limited form of ``lookahead'' by dynamically re-ordering arriving tuples before probing the hashtable.  For this analysis, assume that all machines participate in both the pre- and post-shuffle phases.
 
 % Aside: Belady's anomaly shows that increasing buffer space doesn't always improve hit rates / reduce faults under a FIFO replacement policy.  This anomaly doesn't apply to LRU or the optimal replacement policy.  It's worth considering whether the non-optimal heuristics we'll use can suffer from this anomaly.
@@ -102,7 +116,7 @@ The paper \cite{competitive-reordering-algorithm} considers...
 % TODO: have these strategies been explored in disk-spilling hashtables?
 
 
-\subsection{Selective Bypassing}
+\subsection{Selective Bypass}
 It may be worth investigating work on \emph{caching with bypassing}.  In many caching scenarios, like memory paging in operating systems, there's no option but to evict from the cache.  Our problem of deciding whether to evict a key or directly forward an input tuple is exactly analgous to the problem of caching with bypassing.
 
 Again, we're faced with a trade-off: if we maintain a list of records with poor hit ratios, the space used to maintain that list could also be used to have a bigger cache.  In processors, you can classify individual instructions in a loop as ``tends to cause cache misses`` (or hits), so you only need a small dense array to track hit rate information \cite{automatic-cache-bypass}.
@@ -121,7 +135,7 @@ Again, we're faced with a trade-off: if we maintain a list of records with poor 
 
 Maybe we could break ties when choosing victims by preferring victims that have been recently evicted (a sort of ``poor get poorer'' approach).
 
-\pagebreak
+
 \section{Optimizations for Skewed Data}
 
 \cite{perf-eval-heavy-tail} describes several applications in networking, load-balancing, and scheduling where awareness of skewed data distribution enables optimizations.
@@ -185,14 +199,6 @@ If we draw keys from this Zipf distribution, what's the expected number of uniqu
 
 What's the maximum number of unique keys that could be assigned to one machine?  In principle, all keys could appear on one machine, so we'll look at the distribution of the maximum number of keys per machine.
 
-\section{Performance Metrics}
-
-\subsection{Network utilization}
-
-\subsection{Latency}
-
-\subsection{Throughput}
-
 
 \pagebreak
 \section{Tricks}
@@ -239,11 +245,6 @@ The paper doesn't explore how to efficiently compute the clusteredness, so I'm d
 
 \cite{estimating-cardinality}
 Randomized replacement represents an upper bound on the output size; eviction using lookahead gives a lower bound, even though it's impossible to implement in practice.
-
-\section{Aggregation in graphs}
-
-% TODO: Is there any relationship between aggregation strategies and graph partitioning algorithms?  How do systems like GraphLab actually implement dynamic partitioning given that the space needed to store the "hash" function can be quite large?
-% Is there a good sort of hybrid data structure for compressing those representations?
 
 
 \bibliographystyle{plain}
