@@ -21,7 +21,7 @@
 
 Aggregate-by-key is a common and often expensive operation in ``big data'' frameworks like MapReduce and Spark.
 
-There are many techniques to optimize these aggregations, including hierarchical aggregation techniques, such as aggregation trees, and pre-aggregation techniques, like Hadoop and Spark's map-side combiners.
+There are many techniques to optimize these aggregations, including multi-level aggregation techniques, like aggregation trees, and pre-aggregation techniques, like Hadoop and Spark's map-side combiners.
 The aggregation operator's performance is sensitive to skew in its input data properties, such as uneven frequencies of aggregation keys or an uneven partitioning of the keyspace across machines.
 Its performance can also be order-sensitive; for example, pre-aggregation schemes benefit from ``clusteredness'' in their input data, where values with the same key tend to appear close together in the stream.
 
@@ -29,6 +29,60 @@ All of these optimizations involve trade-offs between latency, memory, network u
 It's also interesting to consider how adaptive query processing techniques might be applied to aggregation in a streaming setting.
 
 The rest of this report summarizes related work in aggregation optimization, proposes some new optimizations, and explores issues related to aggregation and lineage-based fault-tolerance.
+
+\section{Multi-level Aggregation}
+
+Multi-level aggregation techniques, such aggregation trees, can address
+several problems:
+
+\begin{itemize}
+    \item In wireless sensor networks, the network may not be fully-connected
+    and some pairs of nodes must communicate through other intermediate nodes.
+    To save bandwidth (which can lead to large power savings), aggregation can
+    be performed at intermediate nodes of the spanning tree \cite{tag}.
+
+    \item Even if all pairs of nodes can directly communicate, the underlying
+    network topology may not be flat: for example, intra-rack bandwidth can be
+    much greater than intra-rack bandwidth.  In these cases, aggregation trees
+    can reduce the amount of data communicated through the cross-rack
+    bottleneck.
+
+    \item A node's bandwidth is usually shared by all parties communicating
+    with it, so aggregation schemes that send data to a single node may become
+    bottlenecked on that machine's individual network link; aggregation trees
+    can alleviate this problem by reducing the total amount of data sent to
+    any individual machine.
+    % TODO: a comment on MPI-style AllReduce might be appropriate somewhere.
+
+    \item For popular keys, aggregation trees can distribute the processing
+    cost of applying the aggregate function.
+
+\end{itemize}
+
+Hierarchical aggregation may harm performance if it achieves a low reduction
+in network bandwidth. For example, a binary aggregation tree will cause
+a logarithmic increase in execution time if the intermediate aggregations
+don't reduce the data volume.
+
+\subsection{Aggregation on Multiprocessor Machines}
+
+Multiprocessor machines may produce multiple sets of aggregation outputs and
+it is often beneficial to locally combine them.  It may be possible to have
+all processors incrementally update the same aggregation data structures, but
+this may harm performance through cache invalidation and synchronization
+overheads.  Instead, it may be more efficient to give processors their own
+aggregation buffers and merge these in a secondary machine-local aggregation
+phase.
+
+Sparsity may change these trade-offs: if the key space is large and the
+distribution of keys is fairly even, then cache invalidations may already be
+common and updates to the shared structures may be less likely to conflict.
+
+\subsection{Network Non-Linearity}
+
+\textbf{TODO:} recap some of John Canney's discussion on networks behaving
+non-linearly when sending very small packets, and discuss the implications for
+MPI-style AllReduce, etc.
 
 \section{Pre-aggregation}
 
@@ -129,43 +183,60 @@ Again, we're faced with a trade-off: if we maintain a list of records with poor 
 
 % TODO: what about associativity?
 
-\section{Evicting to Local vs. Remote Disk}
+% \section{Evicting to Local vs. Remote Disk}
 
-\section{Breaking Ties When Choosing Victims}
+% \section{Breaking Ties When Choosing Victims}
 
-Maybe we could break ties when choosing victims by preferring victims that have been recently evicted (a sort of ``poor get poorer'' approach).
+% Maybe we could break ties when choosing victims by preferring victims that have been recently evicted (a sort of ``poor get poorer'' approach).
 
+\pagebreak
+
+\section{Recovery}
+
+\textbf{TODO:} Discuss effects of ordering on recoverability.  Ties into ideas
+from materialized view maintenance.  Discuss the ``taint tracking'' idea in
+the context of Spark lineage for accumulator updates.
 
 \section{Optimizations for Skewed Data}
 
-\cite{perf-eval-heavy-tail} describes several applications in networking, load-balancing, and scheduling where awareness of skewed data distribution enables optimizations.
+\cite{perf-eval-heavy-tail} describes several applications in networking,
+load-balancing, and scheduling where awareness of skewed data distribution
+enables optimizations.
 
-\subsection{Machine Learning}
+These optimizations usually work by identifying the most popular keys or data
+elements and processing them differently.
 
-Skew in machine learning: skew can cause problems for classification tasks.
-For example, in fraud detection systems, most transactions are not
-fraudulent, so a naive algorithm that always says ``not fraudulent'' will be
-correct most of the time
-(http://dl.acm.org/citation.cfm?id=1007730.1007738).  In practice,
-techniques can be used to address the imbalance in the underlying data, such
-as performing biased sampling so the fraudulent training examples will be
-weighted more heavily.
+\textbf{TODO:} talk about how this trick can be used to adaptively apply many
+other types of aggregation optimizations (e.g. shared and synchronized (or
+CAS) data structures for infrequent, long-tailed keys, and separate,
+cache-locality-preserving structures for the popular keys).
+
+%\subsection{Machine Learning}
+
+%Skew in machine learning: skew can cause problems for classification tasks.
+%For example, in fraud detection systems, most transactions are not
+%fraudulent, so a naive algorithm that always says ``not fraudulent'' will be
+%correct most of the time
+%(http://dl.acm.org/citation.cfm?id=1007730.1007738).  In practice,
+%techniques can be used to address the imbalance in the underlying data, such
+%as performing biased sampling so the fraudulent training examples will be
+%weighted more heavily.
 
 \subsection{Join Queries}
 
-https://cwiki.apache.org/confluence/display/Hive/Skewed+Join+Optimization
-suggests a scheme where "broadcast join" can be performed on a per-key basis
-in order to mitigate certain types of skew.  See:
-https://issues.apache.org/jira/browse/HIVE-3086
-% Slides: https://cwiki.apache.org/confluence/download/attachments/27362054/Hive+Summit+2011-join.pdf?version=1&modificationDate=1309986642000
+There are several join optimizations for skewed data.  For example,
+\cite{smj-skew-optmization} modifies sort-merge join to devote more resources
+to processing popular keys.
+% TODO: I need to read through the SMJ optimization papers in more detail.
 
- http://dl.acm.org/citation.cfm?id=319072 is earlier academic work that does
- something similar, identifying he most frequent keys and assigning them to
- more processors.
+Apache Hive \cite{hive-join-strategies} employs a scheme that uses
+a shuffle-based join for most keys, but defers joins for the extremely
+frequent keys.  These keys are joined in a separate map-join phase.  This
+approach prevents a single popular key from bottlenecking at a single reducer.
 
- Skew Handling Techniques in Sort-Merge Joins: http://www.cs.arizona.edu/people/dgao/pub/skew.pdf
+% Skew Handling Techniques in Sort-Merge Joins: http://www.cs.arizona.edu/people/dgao/pub/skew.pdf
 
-In the AQP survey framework, this is an adaptive technique that's based on \emph{horizontal partitioning}, picking different traditional query plans for disjoint portions of the query's data.
+% In the AQP survey framework, this is an adaptive technique that's based on \emph{horizontal partitioning}, picking different traditional query plans for disjoint portions of the query's data.
 
 \pagebreak
 \section{Analysis}
