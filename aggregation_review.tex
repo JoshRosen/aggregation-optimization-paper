@@ -86,6 +86,7 @@ This has implications for the scalability of MPI-style all-reduce algorithms tha
 
 \textbf{TODO:} I heard about these effects from John Canny's talk at the Sys/ML lunch; I should find some citations for this.
 
+
 \section{Pre-aggregation}
 
 In engines like MapReduce, aggregation queries can be executed by
@@ -214,6 +215,62 @@ Again, we're faced with a trade-off: if we maintain a list of records with poor 
 % \section{Breaking Ties When Choosing Victims}
 
 % Maybe we could break ties when choosing victims by preferring victims that have been recently evicted (a sort of ``poor get poorer'' approach).
+
+
+
+
+\section{Cost Model for Aggregation Queries}
+
+In this section, we'll develop a cost model for understanding the trade-offs
+in different aggregation schemes.
+
+We have a dataset $D$ with $|D|$ key-value pairs, with $k$ distinct keys.
+Assume that each key-value pair require one unit of memory.
+This dataset is partitioned across $m$ machines.
+
+Assume that the machines are connected by a flat network that behaves
+approximately linearly, transmitting $p$ key-value pairs in $\max(N * p,
+N_{\min})$ units of time, where $N_{\min}$ accounts for fixed overheads when
+sending small messages.
+
+We'll also assume that networking has a negligible CPU overhead, so it's
+possible to maximize both network utilization and useful CPU work.
+
+Let $H$ be the time cost of a hashtable lookup or insertion and $A$ be the
+cost of applying the aggregation function to a pair of values.
+
+\subsection{No Pre-aggregation}
+
+Executing a reduce-by-key with no pre-aggregation requires us to shuffle the
+entire dataset.  With no skew and no pipelining, this takes time 
+\[
+    |D| * (N + H + A).
+\]
+We can interleave the aggregation and shuffle steps, improving
+this to at best $|D| * N$ if we're network bound.
+
+\subsection{Complete Pre-aggregation}
+
+With complete pre-aggregation, we pay for extra pre-shuffle hashtable
+operations, but potentially transfer less data over the network.  If
+pre-aggregation reduces data size at worst a factor of $r$, then
+the total aggregation cost is
+\[
+    |D| * (N/r + (1 + 1/r)H + A).
+\]
+
+\subsection{Plugging in Real Numbers}
+
+\textbf{TODO:} Look up (or measure) realistic values for these constants in
+a system like Spark.
+
+
+
+
+
+
+
+
 
 \pagebreak
 
