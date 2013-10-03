@@ -23,7 +23,7 @@ Aggregate-by-key is a common and often expensive operation in ``big data'' frame
 
 There are many techniques to optimize these aggregations, including multi-level aggregation techniques, like aggregation trees, and pre-aggregation techniques, like Hadoop and Spark's map-side combiners.
 The aggregation operator's performance is sensitive to skew in its input data properties, such as uneven frequencies of aggregation keys or an uneven partitioning of the keyspace across machines.
-Its performance can also be order-sensitive; for example, pre-aggregation schemes benefit from ``clusteredness'' in their input data, where values with the same key tend to appear close together in the stream.
+Its performance can also be order-sensitive; for example, pre-aggregation schemes benefit from ``clusteredness'' in their input data, when values with the same key appear close together in the stream.
 
 All of these optimizations involve trade-offs between latency, memory, network usage, and processor time, so the optimal aggregation technique is a function of the data properties and these resources' relative costs.
 It's also interesting to consider how adaptive query processing techniques might be applied to aggregation in a streaming setting.
@@ -43,15 +43,15 @@ several problems:
 
     \item Even if all pairs of nodes can directly communicate, the underlying
     network topology may not be flat: for example, intra-rack bandwidth can be
-    much greater than intra-rack bandwidth.  In these cases, aggregation trees
+    much greater than inter-rack bandwidth.  In these cases, aggregation trees
     can reduce the amount of data communicated through the cross-rack
     bottleneck.
 
     \item A node's bandwidth is usually shared by all parties communicating
-    with it, so aggregation schemes that send data to a single node may become
-    bottlenecked on that machine's individual network link; aggregation trees
-    can alleviate this problem by reducing the total amount of data sent to
-    any individual machine.
+    with it, so aggregation schemes that send all data to a single node may
+    become bottlenecked on that machine's individual network link; aggregation
+    trees can alleviate this problem by reducing the total amount of data sent
+    to any individual machine.
     % TODO: a comment on MPI-style AllReduce might be appropriate somewhere.
 
     \item For popular keys, aggregation trees can distribute the processing
@@ -80,69 +80,95 @@ common and updates to the shared structures may be less likely to conflict.
 
 \subsection{Network Non-Linearity}
 
-\textbf{TODO:} recap some of John Canney's discussion on networks behaving
-non-linearly when sending very small packets, and discuss the implications for
-MPI-style AllReduce, etc.
+As a simple cost model network communication, we can assume a linear relationship between data size and communication time: halving the amount of data sent between pairs of nodes will halve communication times.
+This model breaks down when pairs of nodes are communicating small volumes of data: at the extremes, hardware and OS network stack overheads can result in all packets below some size threshold requiring the same communication time.
+This has implications for the scalability of MPI-style all-reduce algorithms that communicate \texttt{1/numMachines}-sized chunks of dense vectors.
+
+\textbf{TODO:} I heard about these effects from John Canny's talk at the Sys/ML lunch; I should find some citations for this.
 
 \section{Pre-aggregation}
 
-In distributed engines like MapReduce, these queries can be executed by hash-repartitioning the dataset by its grouping attribute(s), then using a hash-table to compute the aggregates for each group given all of its values.
+In engines like MapReduce, aggregation queries can be executed by
+hash-repartitioning the dataset by its grouping attribute(s), then using
+a hash-table to compute the aggregates for each group given all of its values.
 % TODO: do multiple grouping attributes introduce anything interesting into this scheme?
 
-This can be optimized using \emph{prea-ggregation}, where the aggregation is performed in two phases: first, the subset of a key's values on a particular machine are aggregated into a single value; next, these aggregates are hash-repartitioned and a final aggregation is performed on each group.
+This can be optimized using \emph{pre-aggregation}, where the aggregation is
+performed in two phases: first, the subset of a key's values on a particular
+machine are aggregated into a single value; next, these aggregates are
+hash-repartitioned and a final aggregation is performed on each group.
 This corresponds to Hadoop's ``Combiners'' feature.
-For this optimization to apply, the aggregation function has to be commutative and associative.
+For this optimization to apply, the aggregation function has to be commutative
+and associative.
 % TODO: is this strictly true, or can we use a more-precise or weaker set of properties?
-% TODO: cite TAG.
 
-Pre-aggregation can improve performance by reducing the volume of data set over the network and by distributing the CPU cost of applying the aggregation function to popular keys.
-These benefits come at the cost of additional hash lookups and memory usage during the pre-shuffle phase.
+Pre-aggregation can improve performance by reducing the volume of data set
+over the network and by distributing the CPU cost of applying the aggregation
+function to popular keys.
+These benefits come at the cost of additional hash lookups and memory usage
+during the pre-shuffle phase.
 
-\subsection{Preaggregation and Skew}
+\subsection{Pre-aggregation and Skew}
 
-Skew can affect preaggregation's cost and benefit.  Key-value pairs can exhibit both input and output skew \cite{adaptive-aggregation}.
-With \emph{input skew}, all nodes have the same number of groups but different numbers of records.  Input skew can cause a particular node to become a straggler because it has more input data to process.  In contrast, with \emph{output skew}, nodes have the same number of records but different numbers of groups or distinct keys, which means that some nodes may not have enough buffer space to preaggregate all groups.
+Skew can affect pre-aggregation's cost and benefit.  Key-value pairs can exhibit both input and output skew \cite{adaptive-aggregation}.
+With \emph{input skew}, all nodes have the same number of groups but different numbers of records.  Input skew can cause a particular node to become a straggler because it has more input data to process.  In contrast, with \emph{output skew}, nodes have the same number of records but different numbers of groups or distinct keys, which means that some nodes may not have enough buffer space to pre-aggregate all groups.
 
-\subsection{Partial Preaggregation}
+\subsection{Partial Pre-aggregation}
 
-So far, we've considered preaggregation to be an ``all-or-nothing'' optimization that treats all groups similarly.
-\emph{Partial preaggregation} \cite{partial-preaggregation} is a middle-ground where multiple values for a group may be emitted during the pre-shuffle phase.  For example, 100 values sharing a particular key might be aggregated into two values instead of one.
-This works because the two-phase aggregation strategy still needs to perform a final aggregation, so the ``partial'' preaggregates will be combined during the final aggregation.
+Total pre-aggregation is an ``all-or-nothing'' optimization that performs
+total aggregation on each machine's local data, then performs all
+communication in a separate shuffle phase.
+\emph{Partial pre-aggregation} \cite{partial-preaggregation} relaxes these
+constraints: a single machine may produce multiple partial aggregates for each
+key, and the shuffling of data between machines can be pipelined.
+This works because the two-phase aggregation strategy still needs to perform
+a final aggregation, so the partial pre0aggregates will be combined during
+the final post-shuffle aggregation.
 
-Partial preaggregation overcomes limitations on buffer space for holding the pre-shuffle grouping hash table.
+Partial pre-aggregation overcomes limitations on buffer space for holding the pre-shuffle grouping hash table.
 While sequentially scanning through records, values can be aggregated into matching entries in the hashtable or inserted as new entries.
-When the hashtable becomes full, partial preaggregation algorithms employ an \emph{eviction strategy} to free up space.
-The simplest eviction strategies are to evict a randomly-chosen key or to evict all keys.
+When the hashtable becomes full, partial pre-aggregation algorithms employ an \emph{eviction strategy} to free up space.
+The simplest eviction strategies evict a randomly-chosen key or empty the buffer by evicting all keys.
 Values can be evicted by spooling them to disk or by sending them over the network to the node that performs the final aggregation for those keys.
 
 This is exactly analagous to cache eviction policies, where we want to maximize cache hits (preaggregations), and algorithms like LRU or LFU can be used.
-The optimal eviction strategy is to evict the key that will be hit furthest in the future; it's not possible to actually implement this strategy, but it provides an upper bound on the effectiveness of our eviction strategy.
-% TODO: cite
+The optimal eviction strategy is to evict the key that will be hit furthest in
+the future \cite{Belady1966}; it's not possible to actually implement this
+strategy, but it provides an upper bound on the effectiveness of our eviction
+strategy.
 
-% TODO: what about lookahead or other secondary buffering techniques?
+\subsection{When to Apply Pre-aggregation}
 
-%Partial preaggregation, \cite{partial-preaggregation} assumes that input records arrive in a random order (i.e. their groups are randomly sampled from some (possibly-skewed) distribution).
-
-\subsection{When to Apply Preaggregation}
-
-To decide whether to apply complete preaggregation or perform a shuffle of the entire dataset, we can calculate the total number of groups being aggregated, since preaggregation is beneficial when there are relatively few keys, but may harm performance on data sets with huge numbers of unique or infrequent keys \cite{adaptive-aggregation}.
+To decide whether to apply total pre-aggregation or to shuffle the entire
+dataset, we can calculate the total number of groups being aggregated, since
+pre-aggregation is beneficial when there are relatively few keys, but may harm
+performance on data sets with huge numbers of unique or infrequent keys
+\cite{adaptive-aggregation}.
 Sampling techniques can be used to estimate the number of groups.
-Some systems pick an initial aggregation strategy and adaptively change it if the original cost estimates appear to be wrong (e.g. by having nodes autonomously switch from complete pre-aggregation to direct shuffling of tuples if they do not have enough buffer space for the pre-aggregation hashtable) \cite{adaptive-aggregation}.
+Some systems pick an initial aggregation strategy and adaptively change it if
+the original cost estimates appear to be wrong (e.g. by having nodes
+autonomously switch from total pre-aggregation to direct shuffling of tuples
+if they do not have enough buffer space for the pre-aggregation hashtable)
+\cite{adaptive-aggregation}.
 
-Partial pre-aggregation is a little trickier because it's sensitive to input orderings.  If the input is perfectly clustered by the grouping attributes, then pre-aggregation requires one partial results' worth of buffer space to achieve the maximum reduction in output size.  Knowing the exact distribution of values across groups doesn't help here, since an adversarial input ordering can lead to high eviction rates.
+Partial pre-aggregation is sensitive to the input data ordering, complicating
+this trade-off.  If the input is perfectly clustered by the grouping
+attributes, then pre-aggregation requires one partial results' worth of buffer
+space to achieve the maximum reduction in output size.  Knowing the exact
+distribution of values across groups doesn't help here, since an adversarial
+input ordering can lead to high eviction rates.
 
 % TODO: What about multi-phase partial sorting for aggregation?
 \section{Additional Optimizations for Pre-aggregation}
 
 \subsection{Allocation of Buffer Space}
-There are several tasks to which we can allocate buffer space, including the pre- and post-shuffle hash tables; we can also use buffer space to implement a limited form of ``lookahead'' by dynamically re-ordering arriving tuples before probing the hashtable.  For this analysis, assume that all machines participate in both the pre- and post-shuffle phases.
+Buffer space is a limited resource and in a pipelined execution we have to share it among the pre- and post-shuffle hash tables; we can also use buffer space to implement a limited form of ``lookahead'' by dynamically re-ordering arriving tuples before probing the hashtable.  For this analysis, assume that all machines participate in both the pre- and post-shuffle phases.
 
 % Aside: Belady's anomaly shows that increasing buffer space doesn't always improve hit rates / reduce faults under a FIFO replacement policy.  This anomaly doesn't apply to LRU or the optimal replacement policy.  It's worth considering whether the non-optimal heuristics we'll use can suffer from this anomaly.
 
 \subsection{Buffering for Lookahead}
 
 We might consider using a small amount of buffer space to implement ``lookahead'' against the preaggregation hash table.
-Does this ever make sense?
 Disk drives use a similar idea to serve requests out-of-order to reduce seeks or rotational delays.
 Similarly, sorting can reduce cache misses.
 
@@ -193,9 +219,55 @@ Again, we're faced with a trade-off: if we maintain a list of records with poor 
 
 \section{Recovery}
 
-\textbf{TODO:} Discuss effects of ordering on recoverability.  Ties into ideas
-from materialized view maintenance.  Discuss the ``taint tracking'' idea in
-the context of Spark lineage for accumulator updates.
+\emph{(This idea is more general, but I'm just using Spark as an example)}
+
+These aggregation optimizations may require extensions to Spark's lineage-based failure-recovery mechanisms.
+
+Let's say that we're trying to recover a single lost partition of an
+aggregate-by-key result.  This case is somewhat uninteresting because the lost
+partition possibly depends on all partitions of the un-aggregated data set.
+As a trivial optimization, during recomputation we can only aggregate keys
+that hash into the lost partition.
+
+\emph{(I had an old idea here related to avoiding double-counting of
+aggregated accumulator updates when tasks are recomputed, but this is
+trivially solvable by associating a ``generation'' number with each round of
+recomputation and only partially combining updates belonging to the same
+generation.  This solves a few design problems related to accumulator
+optimizations in Spark, but it's kind of a tangent.)}
+
+\subsection{Ordering and Materialization}
+
+Spark benefits from caching of base and derived datasets, but it's up to the
+user to decide what to cache.
+A simple approach to auto-caching would examine the cost of recomputation and
+frequency-of-use for each intermediate dataset and pick a subset to
+materialize.
+
+Building on ideas from materialized view maintenance in traditional RDBMSs, we
+can rewriting queries to be processed using different derived datasets.  For
+example, say we have the queries \texttt{base.map(f)} and
+\texttt{base.groupByKey(g)}.  If the second query's result is already cached,
+we can use that result to process the first query.  If we're only executing
+the map query, it doesn't make sense to perform the extra shuffle step.
+Similarly, if the shuffled data was lost, it could be recomputed while
+processing the map query, but this is only worth doing if we expect the
+group-by result to be accessed by another query that requires it.
+
+We have to be careful when changing query plans to recompute lost partitions.
+The group-by-key reorders (and compresses) the base data.  The \emph{set} of
+results produced by both map query plans is the same, but the ordering of the
+results in partitions is different.  Recovery needs to take this into account
+to ensure that all of a query's cached partitions are computed from the same
+base or derived data sources.
+
+There are several query rewrites that Spark doesn't currently employ.  For example, given an RDD \texttt{pairs} of key-value pairs, the query
+\texttt{pairs.mapValues(f).groupByKey(g)} can be rewritten to
+\texttt{pairs.groupByKey(g).mapValues(\_.map(f))}, avoiding
+a potentially-costly shuffle.  This optimization can even be applied if the
+grouped pairs aren't cached: if \texttt{f} significantly increases the size of
+the values, then it may be cheaper to apply it post-shuffle so we can shuffle
+less data.
 
 \section{Optimizations for Skewed Data}
 
