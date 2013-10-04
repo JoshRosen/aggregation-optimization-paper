@@ -1,0 +1,171 @@
+\documentclass[12pt]{article}
+\usepackage{geometry}                % See geometry.pdf to learn the layout options. There are lots.
+\geometry{letterpaper}                   % ... or a4paper or a5paper or ... 
+\usepackage[parfill]{parskip}    % Activate to begin paragraphs with an empty line rather than an indent
+\usepackage{graphicx}
+\usepackage{amssymb, amsmath}
+\usepackage{fullpage}
+
+\usepackage{fourier}
+\usepackage{courier}
+
+\usepackage{booktabs, supertabular}
+\usepackage{siunitx}
+\usepackage[siunitx]{circuitikz}
+
+\setcounter{secnumdepth}{0} % supresss section numbers
+
+\title{Automatic Caching in Spark}
+\author{Josh Rosen}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+
+Spark benefits from caching of base and derived datasets, but it's up to the
+user to decide what to cache.  Automatic caching will be a useful optimization
+in multi-user Spark deployments, where several of a company's employees might
+be running different jobs against similar data.  In these cases, users can't
+make optimal caching decisions because they can't see the complete query
+workload.
+
+A simple approach to auto-caching would examine the cost of recomputation and
+frequency-of-use for each intermediate dataset and pick a subset of datasets to
+materialize.
+
+Building on ideas from materialized view maintenance in traditional RDBMSs, we
+can rewrite queries to be processed using different derived datasets.  By
+considering these types of relationships between derived datasets, we can make
+better caching decisions.
+
+Although the ideas are described here in the context of Spark, they are not
+Spark-specific.
+
+\section{Alternative Query Plans}
+
+There are several query rewrites that Spark could employ to execute queries
+against alternative cached datasets.
+
+For example, say we have the queries \texttt{base.map(f)} and
+\texttt{base.groupByKey(g)}.  If the second query's result is already cached,
+we can use that result to process the first query.  If we're only executing
+the map query, it doesn't make sense to perform the extra shuffle step.
+Similarly, if the shuffled data was lost, it could be recomputed while
+processing the map query, but this is only worth doing if we expect the
+group-by result to be accessed by another query that requires it.
+
+As another example, given an RDD \texttt{pairs} of key-value pairs, the query
+\[\texttt{pairs.mapValues(f).groupByKey(g)}\] can be rewritten as
+\[\texttt{pairs.groupByKey(g).mapValues(x => x.map(f))},\] avoiding
+a costly shuffle.  This optimization can even be applied if the
+grouped pairs aren't cached: if \texttt{f} significantly increases the size of
+the values, then it may be cheaper to apply it post-shuffle so we can shuffle
+less data.
+
+For a cached dataset that was transformed using a user-defined function (UDF),
+we may be able to apply inverse transformations in order to run other queries
+against it.  As a toy example, say we had cached \texttt{pairs.mapValues(x =>
+x * 2)}.  To run a query against \texttt{pairs}, we can apply the inverse
+transformation \texttt{mapValues(x => x / 2)} to the cached dataset.
+Automatic inversion of UDFs would be an interesting challenge.
+
+There are a number of existing methods for determining whether queries are
+compatible with views, so we may be able to apply those techniques here.
+
+\subsection{Caching and Partition Pruning}
+
+A cached, partitioned dataset can be used as an index for
+selection queries.  We can avoid scanning partitions whose values fall outside
+of a partition's range.  Shark already applies this ``partition-pruning
+optimization''.  To automatically perform this optimization in Spark, we need
+a mechanism to inspect \texttt{filter} predicates.  We may also want
+conditional query plans that allow the query to fall back on a regular scan if
+the relevant parts of the partitioned dataset are lost.
+
+\subsection{Alternative Plans and Recovery}
+
+The query processor has a few options for handling runtime failures: it can
+restart the entire query, try to recompute only the lost partitions, or ignore
+the failure and return a lower-quality result.  This is a non-trivial problem,
+because statistics generated during query execution might suggest that an
+alternative plan would be faster.
+
+We must be careful when using an alternate query plan to recompute lost
+partitions.
+The group-by-key reorders (and compresses) the base data.  The \emph{set} of
+results produced by both map query plans is the same, but the ordering of the
+results in partitions is different.  Recovery needs to take this into account
+to ensure that all of a query's cached partitions are computed from the same
+base or derived data sources.  Going further, some jobs might be sensitive to
+the ordering of values in partitions, so recomputation must \emph{always}
+produce the exact same order of results.  It would be useful if the query
+planner knew about these cases, since they restrict its ability to optimize
+queries.
+
+
+\section{Choosing What to Cache}
+
+Maybe we can adapt DynaMat's \cite{dynamat} view selection policies to decide
+which intermediate results to materialize.  Like DynaMat, we're concerned with
+both storage and recomputation costs.  Unlike DynaMat, our views are immutable
+and don't have a periodic update cost.
+
+DynaMat's cost model incorporates relationships between views: a view's
+update cost may be amortized over other the views that it can recompute
+(in some cases, this can cause a view to have a negative update cost).
+In DynaMat, a \emph{child} view is derived from a \emph{father} view if
+it was originally computed from that view.  When calculating change in total
+update cost from not recomputing a father, DynaMat accounts for savings in its
+children's update costs:
+\[
+    U_{delta}(f)
+    =
+    UC(f)
+    - \sum\limits_{f_{child} \in \mathcal{V} : father(f_{child}) = f}
+    \left(UC^{new}(f_{child}) - UC^{old}(f_{child})\right),
+\]
+where $UC^{new}$ is the cost of updating the child without using its father,
+so the summation is counting the increased child update costs against the cost
+savings $UC(f)$ from not updating the father.
+
+A limitation of DynaMat's analysis is that it only considers parent-child
+relationships that actually occurred during view materialization, rather than
+considering the complete set of possible parents for the child.
+% TODO: the above is a little inprecise / confusingly-worded.
+This could have bad performance implications for some Spark jobs.  Say that one 
+query materializes a filtered subset of the base data it, followed by another
+query that materializes a shuffled version of the base data.  Even though the
+filter query's result was computed from the base data, we should also consider
+that it can be executed on the shuffled data (possibly benefiting from
+partition-pruning) when deciding whether to materialize the shuffle output.
+
+Because we don't have a periodic view update window, we can reduce the problem
+to deciding which cached results to evict in order to cache new results.
+This extends caching heuristics like LRU to account for relationships between
+the cached items.
+
+\subsubsection{Iteration and Automatic Caching}
+
+There may be some workloads for which automatic caching will perform poorly.
+For example, some iterative machine learning workloads generate and discard
+many intermediate datasets while always accessing a base dataset.
+A programmer who knows about this access pattern can manually optimize this,
+but an automatic technique may sacrifice performance during the first few
+iterations until it infers the access pattern.  This is one of the main
+arguments for extending Spark's DSL to be loop-aware.
+
+Perhaps there's a simple policy that gracefully handle loops: if the eviction
+policy is biased towards retaining datasets that derive many other datasets at
+low cost, then reused datasets will tend to stay in the cache.  The ideal
+cached dataset has many immediate children; other successors carry less weight,
+since it doesn't necessarily make sense to cache the root of a very long
+lineage chain if its most distant successors are frequently-accessed and
+expensive to compute.
+
+
+\bibliographystyle{plain}
+\bibliography{aggregation}
+
+
+\end{document}
