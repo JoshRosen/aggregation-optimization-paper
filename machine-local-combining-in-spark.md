@@ -27,7 +27,7 @@ There are two invariants that we can exploit in order to cleanly implement machi
 
 ## Algorithm
 
-We'll use the BlockManager to store metadata about which blocks have been locally reduced, and merge mew map outputs with existing stored map outputs from the same job:
+We'll use the BlockManager to store metadata about which blocks have been locally reduced, and merge new map outputs with existing stored map outputs from the same job.  For blocks that have been folded into a local aggregate, we'll send small messages to the reducers to let them know that they should expect to read those blocks via the aggregate:
 
 ```
 def mapTask(partitionId, data, isSpeculative) {
@@ -42,8 +42,8 @@ def mapTask(partitionId, data, isSpeculative) {
                 if (!combinerBlock.wasSent) {
                     // Merge into the existing block:
                     combinerBlock.accumulate(mapOutput)
-                    // Store a dummy block:
-                    blockManager.put("map_output_" + partitionId, [])
+                    // Store a pointer to the aggregate
+                    blockManager.put(AggregatePointer("map_output_" + partitionId, combinerBlock)
                 }
             }
         }
@@ -51,6 +51,20 @@ def mapTask(partitionId, data, isSpeculative) {
         combinerInfo.block = "map_output_" + partitionId
         blockManager.put(mapOutputs, combinerInfo.block,
                          StorageLevel.MemoryAndDisk)
+    }
+}
+
+def reduceTask(partitionId) {
+    blocksInAggregate = {}
+    asynchronously fetch missing blocks { block =>
+        if (block.isAggregatePointer) {
+            blocksInAggregate[block.agg] += block.id    
+        } else if (block.isAggregate) {
+            // If the aggregate doesn't have the expected blocks, re-fetch all of
+            // those blocks because we had a failure.
+        } else {
+            // Regular block, just add it.
+        }
     }
 }    
 ```
@@ -89,3 +103,36 @@ Proposed Invariants:
 ## TODO
 
 - Fix the speculation edge-case that limits the combining (minor lack of clarity above, not a technical issue)
+
+- Always prefer to flush shuffle blocks to disk.
+
+- This might lead to more shuffle blocks remaining in memory at once, causing
+  us to run out of send-side memory unless we properly implement spilling.
+
+- Shuffle files should be consolodated on disk UNLESS a file has already been
+  fetched.  Basically, we need to have "repeatable read" semantics.
+
+
+## References
+
+https://github.com/mesos/spark/pull/635
+https://github.com/mesos/spark/pull/669
+https://issues.apache.org/jira/browse/MAPREDUCE-4584
+
+Hadoop was faced with this exact problem:
+https://issues.apache.org/jira/browse/MAPREDUCE-4502
+
+They have an approach with the "combiner per node" idea, outlined here:
+https://issues.apache.org/jira/secure/attachment/12579117/design_v3.pdf
+
+Again, the key challenge seems to be fault-tolerance.
+
+They delay the task attempt completion events to prevent duplicate fetches of aggregation targets.
+
+The patch is complicated, though; 100+ kB of changes for something with a confusing fault-tolerance strategy.
+
+https://issues.apache.org/jira/secure/attachment/12544415/speculative_draft.pdf
+
+http://www.slideshare.net/ozax86/prestrata-hadoop-word-meetup
+
+https://code.google.com/p/sailfish/wiki/SailfishInternals
