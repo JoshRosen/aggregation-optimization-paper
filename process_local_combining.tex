@@ -121,7 +121,10 @@ in the map and reduce phases.
 
 In this section, we'll assume that all shuffle data fits in memory (i.e. we
 never hit disk); in later sections, we'll extend this to support on-disk
-coalescing of shuffle outputs.
+coalescing of shuffle outputs.  For brevity's sake, we'll present the
+algorithm for multiple mappers and a single reducer; reducers operate on
+disjoint partitions of data, so this approach generalizes to multiple reducers
+by instantiating one instances of the algorithm per reducer.
 
 At a high-level, our strategy will aggregate new map outputs into existing map
 outputs from the same job that are stored on the same machine.  Reducers will
@@ -146,7 +149,18 @@ def blockManagerMaster(message) {
    }
 }
 
-def mapTask(partitionId, data, isSpeculative) {
+def blockManager(message) {
+    message match {
+        FetchBlock(block_id) => {
+            synchronized (blockInfo(block_id)) {
+                block.markRead()
+                return block.data
+            }
+        }
+    }
+}
+
+def mapTask(partitionId, data, isRecomputation) {
     // Produce the map outputs:
     mapOutput = f(data)
     blockName = "reduce_" + partitionId
@@ -154,97 +168,144 @@ def mapTask(partitionId, data, isSpeculative) {
     synchronized (blockInfo) {  // Lock out readers
        // Commit the block, then decide how to aggregate it:
        ack = blockManagerMaster.send(CommitBlock(blockName))
-       if (ack.isFirst) {
-         combinerBlock = LocalCombinerManager.getCombiner(stageId)
-         if (combinerBlock == null) {
+       combinerBlock = LocalCombinerManager.getCombiner(stageId)
+       if (!ack.isFirst) {
+         // Another task already computed this block; discard it.
+         return
+       }
+       if (combinerBlock != null && !combinerBlock.wasRead) {
             // Merge into the existing block:
             combinerBlock.accumulate(mapOutput)
             // Store a pointer to the aggregate:
             blockManager.put(AggregatePointer(blockName,
                                               combinerBlock.name))
-         } else {
+       } else {
             // Store regularly, then mark as the new combiner block
             blockManager.put(blockName, mapOutput)
             combinerBlock =
                LocalCombinerManager.registerCombiner(stageId,
                                                      combinerBlock)
-         }
-       } else {
-         // Another task already computed this block; discard it.
        }
     }
 }
 
 def reduceTask(partitionId) {
-    blocksInAggregate = {}
+    blocksInAgg = {}
     missingBlocks = {}
     finalAggregate = new Aggregate()
     asynchronously fetch missingBlocks{ block =>
-        if (block.isAggregatePointer) {
-            blocksInAggregate[block.agg] += block.id    
-            // Sanity check: if a pointer comes after the receipt of a
-            // block, then what?  
-        } else if (block.isAggregate) {
-            finalAggregate.add(block)
-            // If the aggregate doesn't have the expected blocks,
-            // re-fetch all of those blocks because we had a failure.
-            if (block.aggregatedBlocks != blocksInAggregate[block.agg]) {
-               missingBlocks.add(blocksInAggregate[block.agg] - blocks.aggregatedBlocks)
+        block match {
+            case AggregatePointer(id, target) =>
+                blocksInAgg[target] += orig
+                // Sanity check: if a pointer is received after the block
+                // it references, the referenced block should contain data
+                // from the partition that sent the pointer.
+            case Aggregate(id, sourceBlocks, data) => {
+                finalAggregate.add(data)
+                // If the aggregate doesn't have the expected blocks,
+                // re-fetch all of those blocks because we had a failure.
+                if (sourceBlocks != blocksInAgg[block.id]) {
+                   missing = blocksInAgg[block.id]
+                   missingBlocks.add(blocksInAgg[block.id] - sourceBlocks)
+                }
             }
-        } else {
-            // Regular block, just add it.
-            finalAggregate.add(block)
+            case RegularBlock(id, data) => {
+                finalAggregate.add(data)
+            }
         }
     }
-}    
+}
 \end{minted}
 
 This algorithm handles several failure modes, some of which are subtle:
-\textbf{TODO: some of the cases still need to be debugged:}
 
 \begin{itemize}
-   \item A speculative copy of a map task runs to completion
-before the original map task; however, the original also completes before the
-shuffle phase begins.  In this case, two copies of this map task's output are
-stored: the non-combined output from the speculative task and a pointer to
-combined output for the original task.  When reducers ask for this task's
-shuffle block, the BlockManagerMaster needs to list the speculative copy as the
-first location for this block.
+   \item \textbf{Mapper failures during reduce:} If a mapper fails while
+   reducers have fetched a subset of its outputs, we need to ensure that those
+   reducers eventually re-request any missing blocks.  If a mapper fails after
+   a reducer has received its pointers to aggregated blocks that haven't been
+   fetched, the aggregated block will be marked as missing and recomputed.
+   When it receives the recomputed block, the reducer will realize that its
+   contents don't match the expected contents that were calculated from the
+   pointers, causing the other missing blocks to be recomputed.
 
-This might be addressed by adding a 'commit' phase, where output's
-availability is registered with the BlockManagerMaster before deciding whether
-to combine it or not.  If a speculative task completes first, then the
-original copy of that task won't aggregate its output with any other blocks.
+   Unfortunately, this adds some latency because the reducer doesn't
+   re-request all of missing blocks as soon as the failure occurs.  We could
+   address this problem by having the reducer immediately re-request a block's
+   pointers if the block's fetch fails due to a crashed mapper.  This would be
+   easy to express in an event-driven framework, where block requests return
+   immediately with either ``fetch started'' or ``recomputation started''
+   messages.
 
-This doesn't address the opposite situation, where the speculative task
-finishes second but the original task's output has already been saved.  We
-could handle this case by still storing the speculative task, but under
-a different name.  We would only need to access this block if the mapper that
-ran the original mapper failed.  To handle this, we can add special-case logic
-to the BlockManagerMaster to search for this block when the last copy of
-a shuffle block is removed from its mapping; if the block is found, we can
-rename it.
+   \item \textbf{Aggregation of recomputed map outputs:} Since we always
+   persist shuffle outputs on disk, shuffle outputs are only recomputed when
+   mappers fail.  Our aggregation strategy only aggregates map outputs into
+   blocks that have not yet been fetched by reducers.  If multiple map outputs
+   are recomputed using the same machine, the recomputed tasks will share
+   a new combiner block.
 
-This adds a lot of complexity, though, and since we'll eventually abort
-redundant copies of speculative tasks, we could simply discard the output of
-speculative tasks that don't finish first.
-\end{itemize}
+   \item \textbf{Speculative execution:} With speculative execution, multiple
+   tasks could be racing to compute the same map output.  There aren't
+   significant benefits to caching redundant copies of shuffle blocks, so our
+   use of a commit protocol allows us to store only the first copy of a block.
 
-This scheme preserves several invariants:
+  % Note: it's possible to extend the protocol to not throw away redundant
+  % copies, since this gives us some limited fault-tolerance capability, but
+  % the complexity doesn't seem justifiable:
 
-\begin{itemize}
-   \item All live copies of a block are identical.
+  % This might be addressed by adding a 'commit' phase, where output's
+  % availability is registered with the BlockManagerMaster before deciding
+  % whether to combine it or not.  If a speculative task completes first, then
+  % the original copy of that task won't aggregate its output with any other
+  % blocks.
+
+  % This doesn't address the opposite situation, where the speculative task
+  % finishes second but the original task's output has already been saved.  We
+  % could handle this case by still storing the speculative task, but under
+  % a different name.  We would only need to access this block if the mapper
+  % that ran the original mapper failed.  To handle this, we can add
+  % special-case logic to the BlockManagerMaster to search for this block when
+  % the last copy of a shuffle block is removed from its mapping; if the block
+  % is found, we can rename it.
+
 \end{itemize}
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \subsection{Pipelining}
 
-The above scheme can be extended to support a limited form of pipelined
+This aggregation scheme can be extended to support a limited form of pipelined
 reduce, where reducers can begin fetching outputs from completed mappers while
-other mappers are still executing.
+other mappers are still executing.  We simply add additional locking to ensure
+that partial pre-aggregates become immutable once they have been read.  This
+avoids problems where a completed map task aggregates its results into a block
+that has already been fetched and that may not be re-requested unless
+a reducer fails.
 
-TODO: finish this section, mention ``repeatable read'' semantics.
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection{Spilling Shuffle Data to Disk}
+
+We can employ similar strategies for spilling shuffle data to disk.  By
+keeping shuffle outputs in memory, we should avoid hitting disk for shuffles
+with many partitions and little data per partition (one of the
+worst-performing cases in terms of bytes of data read per random access).  The
+machine-local combining should also significantly reduce the shuffled data
+volume.
+
+Even though these techniques may mitigate most of the disk performance
+bottlenecks, we still need to handle the case where we don't have enough
+memory to hold all of the machine-local pre-aggregates.  In this case, we can
+spill partial pre-aggregates to disk.  We can employ a similar ``indirection''
+scheme, storing pointers such that the combined files on disk are requested
+and processed similarly to how we process aggregates.
+
+\textbf{TODO:} I haven't thought through disk-based strategies that much,
+since I expect that with this type of pre-aggregation, the jobs that would
+need to spill the partial aggregates to disk would either cause the reducers
+to run out of memory when reading those aggregates, or would run out of memory
+while constructing a hashtable in the mapper.  It may be worth revisiting this
+    if we add more general ``graceful-degradation'' under memory pressure by
+        using disk-spilling algorithms and data structures.
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
