@@ -9,6 +9,7 @@
 \usepackage{times}
 \usepackage{courier}
 \usepackage{minted}
+\usepackage{url}
 
 \setcounter{secnumdepth}{0} % supresss section numbers
 
@@ -18,38 +19,38 @@
 \begin{document}
 \maketitle
 
-In current versions of Spark, \texttt{reduceByKey} shuffles
+In current versions of Spark, \texttt{combineByKey} shuffles
 $O(\text{numMapPartitions} * \text{numReducers})$ blocks over the network.  In
 most cases, it would be more efficient to perform a process-local reduction of
 all of the blocks processed by a particular worker, since this may
 drastically reduce the amount of data we need to shuffle.
 
-Currently, \texttt{reduceByKey} performance can degrade when a large number of
+Currently, \texttt{combineByKey} performance can degrade when a large number of
 map partitions are used: we may transfer $O(\text{numMapPartitions}
-* \text{numReducePartitions})$ blocks when, ideally, we could transfer only
+* \text{numReducePartitions})$ blocks when ideally we could transfer only
 $O(\text{numMappers} * \text{numReducePartitions})$.
 
 Large numbers of map tasks also cause problems for disk-based shuffles: disk
-performance can rapidly degrade if the reduce phase causes many seeks on the
-mappers' disks.
+performance can rapidly degrade if the reduce phase causes many seeks to fetch
+many small files.
 
 These problems are barriers to efficiently supporting tiny tasks as
 a skew-mitigation and load-balancing technique \cite{tinytasks}.
 
-Fault-tolerance is the main difficulty in fixing these problems: correct
-solutions need to handle failing map and reduce tasks and properly handle
-output from speculative tasks.
+Fault-tolerance is one of the the main difficulties in fixing these problems:
+correct solutions need to support speculative execution, failure of map and
+reduce tasks, and recomputation of missing shuffle blocks.
 
 \section{Existing Solutions and Proposals}
 
-There have been multiple proposals to solve these problems in Hadoop and Spark.
+There have been multiple proposals to address these problems in Hadoop and Spark.
 
 Sailfish \cite{sailfish} introduces an
 abstraction that allows map outputs from multiple writers to be batched
 together on disk based on which reducer will process them.  Their
 $\mathcal{I}$-files abstraction also allows the number of reducers to be
-determined between the map and reduce phases by maintaining indices to support
-efficient retrieval of key ranges.
+determined at runtime (between the map and reduce phases) by maintaining
+indices to support efficient retrieval of key ranges.
 
 For Spark, \texttt{SPARK-751} \cite{SPARK-751} proposes a scheme where shuffle block
 writers are shared between multiple map tasks, and on-disk files store the
@@ -90,7 +91,8 @@ When selecting a victim to spill to disk, the BlockStore can use its knowledge
 of shuffle access patterns to make good eviction decisions.  Once a shuffle
 block has been read, it won't be re-read unless a reducer fails.  When
 a BlockStore is asked to store a number of shuffle blocks, it may infer that
-a shuffle phase is being performed and that many accesses will be to shuffle
+a shuffle phase is being performed and that many of the next accesses will be
+to shuffle
 blocks.  Finally, non-dirty disk-resident blocks can be evicted without
 performing disk writes. Combining these ideas, we can use the following
 heuristic eviction order:
@@ -98,7 +100,7 @@ heuristic eviction order:
 \begin{itemize}
         \item Shuffle blocks that have already been sent
         \item Any blocks that are already on disk
-        \item Shuffle blocks received but not yet processed
+%        \item Shuffle blocks received but not yet processed
         \item Shuffle blocks that have not been sent
         \item Non-shuffle blocks, using the regular LRU eviction policy
 \end{itemize}
@@ -107,8 +109,9 @@ To improve this approach, we can use a background cleaner thread that
 proactively flushes blocks to disk.  Whenever a shuffle block has been sent,
 it can immediately be dropped to disk.  We could extend this approach to
 continuously flush cached datasets to disk as long as there's free disk
-bandwidth to allow for quick eviction of cached datasets (and disk-based
-fault-tolerance).
+bandwidth, allowing for quick eviction of cached datasets (assuming the disk
+bandwidth would be otherwise unused, this also gives us free checkpointing).
+
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \subsection{Machine-Local Pre-Aggregation}
@@ -124,18 +127,19 @@ never hit disk); in later sections, we'll extend this to support on-disk
 coalescing of shuffle outputs.  For brevity's sake, we'll present the
 algorithm for multiple mappers and a single reducer; reducers operate on
 disjoint partitions of data, so this approach generalizes to multiple reducers
-by instantiating one instances of the algorithm per reducer.
+by instantiating one instance of the algorithm per reducer.
 
 At a high-level, our strategy will aggregate new map outputs into existing map
-outputs from the same job that are stored on the same machine.  Reducers will
+outputs from the same phase that are stored on the same machine.  Reducers will
 still issue requests for each individual map output, but in response they may
 receive a regular map output, the combination of several map outputs, or a
-small pointer with the address of the combined output that contains the
+small pointer with the address of the combined output that aggregates the
 requested output's data.
 
-At a high level, we can use the following strategy to combine a node's outputs:
+The following psuedocode sketches this strategy at a high level:
 
 \begin{minted}{scala}
+// On the single Master node:
 def blockManagerMaster(message) {
    message match {
       CommitBlock(block_id) => {
@@ -149,6 +153,7 @@ def blockManagerMaster(message) {
    }
 }
 
+// On each worker's local BlockManager:
 def blockManager(message) {
     message match {
         FetchBlock(block_id) => {
@@ -174,7 +179,8 @@ def mapTask(partitionId, data, isRecomputation) {
          return
        }
        if (combinerBlock != null && !combinerBlock.wasRead) {
-            // Merge into the existing block:
+            // Merge into the existing block.
+            // We assume that this operation will succeed:
             combinerBlock.accumulate(mapOutput)
             // Store a pointer to the aggregate:
             blockManager.put(AggregatePointer(blockName,
@@ -184,7 +190,7 @@ def mapTask(partitionId, data, isRecomputation) {
             blockManager.put(blockName, mapOutput)
             combinerBlock =
                LocalCombinerManager.registerCombiner(stageId,
-                                                     combinerBlock)
+                                                     blockNamblockName)
        }
     }
 }
@@ -203,9 +209,8 @@ def reduceTask(partitionId) {
             case Aggregate(id, sourceBlocks, data) => {
                 finalAggregate.add(data)
                 // If the aggregate doesn't have the expected blocks,
-                // re-fetch all of those blocks because we had a failure.
+                // re-fetch all of those blocks because we had a failure:
                 if (sourceBlocks != blocksInAgg[block.id]) {
-                   missing = blocksInAgg[block.id]
                    missingBlocks.add(blocksInAgg[block.id] - sourceBlocks)
                 }
             }
@@ -217,7 +222,7 @@ def reduceTask(partitionId) {
 }
 \end{minted}
 
-This algorithm handles several failure modes, some of which are subtle:
+This algorithm handles several failure modes:
 
 \begin{itemize}
    \item \textbf{Mapper failures during reduce:} If a mapper fails while
@@ -233,21 +238,23 @@ This algorithm handles several failure modes, some of which are subtle:
    re-request all of missing blocks as soon as the failure occurs.  We could
    address this problem by having the reducer immediately re-request a block's
    pointers if the block's fetch fails due to a crashed mapper.  This would be
-   easy to express in an event-driven framework, where block requests return
+   easy to express in an event-driven model block requests return
    immediately with either ``fetch started'' or ``recomputation started''
-   messages.
+   messages, and the fetched data is delivered through a callback or Future.
 
-   \item \textbf{Aggregation of recomputed map outputs:} Since we always
+   \item \textbf{Recomputed map outputs:} Since we always
    persist shuffle outputs on disk, shuffle outputs are only recomputed when
    mappers fail.  Our aggregation strategy only aggregates map outputs into
-   blocks that have not yet been fetched by reducers.  If multiple map outputs
-   are recomputed using the same machine, the recomputed tasks will share
-   a new combiner block.
+   blocks that have not yet been fetched by reducers (this is why
+   BlockManagers track whether blocks have been read).  If multiple map
+   outputs are recomputed using the same machine, the recomputed tasks will
+   share a new combiner block and be able to benefit from pre-aggregation.
 
    \item \textbf{Speculative execution:} With speculative execution, multiple
    tasks could be racing to compute the same map output.  There aren't
-   significant benefits to caching redundant copies of shuffle blocks, so our
-   use of a commit protocol allows us to store only the first copy of a block.
+   significant benefits to caching redundant copies of shuffle blocks, so we
+   only aggregate or store the first copy of a map task's output.  To avoid
+   races, the Master acts as the coordinator for ``committing'' map outputs.
 
   % Note: it's possible to extend the protocol to not throw away redundant
   % copies, since this gives us some limited fault-tolerance capability, but
@@ -270,6 +277,17 @@ This algorithm handles several failure modes, some of which are subtle:
 
 \end{itemize}
 
+The above psuedocode assumes that a mapper's combined data can always be
+succesfully merged into the per-machine aggregate.  If we're extreme memory
+pressure, we could spill some map tasks' output to disk and finish the
+pre-aggregation before we deliver those partitions to reducers.
+
+In this approach, mappers don't need to be notified once they have processed
+their final map task in a map phase.  State is shared between map tasks, but
+that state is stored in the BlockManager, allowing tasks from other jobs to
+run concurrently (we don't have to set up and tear down an explicit
+``context'' in order to persist and share data across tasks).
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \subsection{Pipelining}
 
@@ -285,26 +303,32 @@ a reducer fails.
 \subsection{Spilling Shuffle Data to Disk}
 
 We can employ similar strategies for spilling shuffle data to disk.  By
-keeping shuffle outputs in memory, we should avoid hitting disk for shuffles
+keeping shuffle outputs in memory, we will avoid hitting disk for shuffles
 with many partitions and little data per partition (one of the
-worst-performing cases in terms of bytes of data read per random access).  The
-machine-local combining should also significantly reduce the shuffled data
-volume.
+worst-performing cases in terms of bytes of data read per disk seek).  For
+many combine-by-key operations, machine-local combining should significantly
+reduce the shuffled data volume.
 
-Even though these techniques may mitigate most of the disk performance
-bottlenecks, we still need to handle the case where we don't have enough
-memory to hold all of the machine-local pre-aggregates.  In this case, we can
-spill partial pre-aggregates to disk.  We can employ a similar ``indirection''
+For jobs that do not benefit from combiners, we still may have to spill
+shuffle output to disk.  We can employ a similar ``indirection''
 scheme, storing pointers such that the combined files on disk are requested
 and processed similarly to how we process aggregates.
 
-\textbf{TODO:} I haven't thought through disk-based strategies that much,
-since I expect that with this type of pre-aggregation, the jobs that would
-need to spill the partial aggregates to disk would either cause the reducers
-to run out of memory when reading those aggregates, or would run out of memory
-while constructing a hashtable in the mapper.  It may be worth revisiting this
-    if we add more general ``graceful-degradation'' under memory pressure by
-        using disk-spilling algorithms and data structures.
+This still supports aggregation: we can just spill partial pre-aggregates to
+disk.
+
+\textbf{TODO:} I haven't thought through the details of the file consolodation
+approach, but we could probably borrow Sailfish's approach with a few minor
+modifications to account for the fact that we're writing to local disks
+instead of a DFS.
+
+%\textbf{TODO:} I haven't thought through disk-based strategies that much,
+%since I expect that with this type of pre-aggregation, the jobs that would
+%need to spill the partial aggregates to disk would either cause the reducers
+%to run out of memory when reading those aggregates, or would run out of memory
+%while constructing a hashtable in the mapper.  It may be worth revisiting this
+    %if we add more general ``graceful-degradation'' under memory pressure by
+        %using disk-spilling algorithms and data structures.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
