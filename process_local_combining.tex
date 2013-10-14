@@ -330,6 +330,49 @@ instead of a DFS.
     %if we add more general ``graceful-degradation'' under memory pressure by
         %using disk-spilling algorithms and data structures.
 
+\subsection{Correctness}
+
+As an informal proof of correctness, note that this process-local aggregation
+scheme maintains a few invariants:
+
+First, we ensure that there is only one accessible copy of each shuffle block.
+For speculative tasks, the master can use the ordering of task completion
+messages to commit only the first copy of concurrently-running copies of
+a task; in the rare case that two speculative tasks finish in quick succession
+(before the second, redundant is killed by the master), the second task will
+discard its output and the master won't add it to the list of stored blocks.
+
+We assume that mappers may only exhibit total failures in which they lose all
+shuffle blocks.  We still need to handle edge-cases where a node becomes
+temporarily inaccessible, is marked as dead by the master, and eventually
+re-connects and becomes live again.  To handle this case, we can require the
+node to re-register its blocks with the BlockManagerMaster; during this
+re-registration, we could drop that node's shuffle blocks.  It would be safe
+to re-register the recovered node's shuffle blocks only if none of those
+blocks were recomputed elsewhere during the failure; however, this will be
+prone to races and difficult to implement.
+
+\subsubsection{Reducers' handling of failures}
+
+The fetching of shuffle outputs is controlled by reducers.  The fetching
+protocol maintains the invariant that shuffle outputs delivered to reducers
+may always be immediately aggregated without leading to over-counting.  This
+is clearly true when there are no failures, because the task completion
+``commit'' protocol ensures that each shuffle block is only computed once and
+any process-local aggregation is performed only after a successful commit.
+
+This protocol is also correct during mapper failures: over-counting could only
+occur if a map task was computed twice, which could only happen if a reducer
+requested it twice.  Reducers will only re-request shuffle blocks that they
+have not received.  When an aggregated shuffle block is received by a reducer,
+it contains the ids of the shuffle blocks that were aggregated into it, so the
+reducer won't re-fetch those blocks.  If a reducer receives an aggregated
+block whose contents don't match the expected contents (calculated from the
+``pointer'' blocks that it received), then a failure occurred and the
+aggregate block was recomputed and contains a subset (possibly only one block)
+of the blocks that it should have contained.  It's safe for the reducer
+to add this block to its aggregate and re-request only the missing blocks.
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
