@@ -112,6 +112,45 @@ continuously flush cached datasets to disk as long as there's free disk
 bandwidth, allowing for quick eviction of cached datasets (assuming the disk
 bandwidth would be otherwise unused, this also gives us free checkpointing).
 
+% I believe that this is called "write behind caching".
+
+As a further optimization, note that a RDD's block's share the same access
+pattern: readers will typically access all blocks of an RDD at the same time,
+so there are sets of blocks that should be considered equivalent with
+respect to the ordering of blocks by most recent access time (in other words,
+we have a logical partial ordering of block access times).
+%
+By flushing blocks beloinging to the same RDD, we can benefit from sequential
+scans when reading them back.
+
+% Disk buffer caches in operating systems might make this optimization for
+% small files: they can consider evicting all of the blocks corresponding to
+% a file, since the cost to read those blocks back sequentially might be
+% cheaper.
+
+% Maybe we could "hedge our bets" by dropping half of the blocks from two
+% different RDDs, or some other ratio.  We might uncertainty about which
+% queries will be re-run in the future, and the cost-savings from
+% materialization or caching aren't "all-or-nothing" because our computation
+% is independently parallelizable at some level.  So, instead, we maintain
+% a probability distribution over acess patterns and optimize for the least
+% expected cost given that distribution.
+
+% Another aside: the "fork-join" patterns can exhibit really bad cache
+% behavior with the FIFO replacement policy if we're not explicitly
+% uncaching the pre-fork dataset after each iteration.
+% This could be solved with a form of reference-counting-based GC
+% that determines if there are no non-lineage references to an RDD
+% and marks its blocks as early eviction candidates (a type of automatic lazy
+% uncache).
+%
+% This is fairly non-trivial to implement in Java, but we might be able
+% to hack it together using PhantomReference.  We could return RDDs to
+% the client DSL that are actually PhantomReferences to RDDs or something,
+% so when the DSL object has no more references, it's GC'd and we get the
+% PhantomReference callback, letting us know that the underlying RDD
+% has no non-lineage references.  This would be really nasty, though.
+
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \subsection{Machine-Local Pre-Aggregation}
