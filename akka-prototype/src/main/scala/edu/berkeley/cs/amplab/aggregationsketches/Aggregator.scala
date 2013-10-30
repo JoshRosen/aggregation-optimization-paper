@@ -21,7 +21,7 @@ class Aggregator[K, V, C](bufferSize: Int,
     writer.write((key, createCombiner(value)))
   }
 
-  def aggregateStream(stream: Iterator[(K, V)]) {
+  def aggregateStream(stream: TraversableOnce[(K, V)]) {
     for ((key, value) <- stream) {
       if (policy.shouldBypassCache(key)) {
         bypassCache(key, value)

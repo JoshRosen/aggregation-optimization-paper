@@ -43,29 +43,47 @@ trait EvictionPolicy[K] {
 class NoPreAggregationEvictionPolicy[K] extends EvictionPolicy[K] {
   override def shouldBypassCache(key: K) = true
 
-  def chooseVictim(key: K, buffer: Buffer): Option[K] = {
+  override def chooseVictim(key: K, buffer: Buffer): Option[K] = {
     throw new UnsupportedOperationException()
   }
+
+  override def toString: String = "NoPreaggregationEvictionPolicy"
+
 }
 
 class RandomEvictionPolicy[K](seed: Long = 42) extends EvictionPolicy[K] {
   private val rand = new Random(seed)
 
-  def chooseVictim(key: K, buffer: Buffer): Option[K] = {
+  override def chooseVictim(key: K, buffer: Buffer): Option[K] = {
     val chosenKey = rand.nextInt(buffer.size)
     Some(buffer.keySet.toIndexedSeq(chosenKey))
   }
-}
 
-// Idea: use a Bloom filter to always evict the first occurrence of a key.
+  override def toString: String = "RandomEvictionPolicy"
+}
 
 class CountMinSketchEvictionPolicy[K](eps: Double, delta: Double, seed: Int = 42,
                                       heavyHittersPct: Double = 0.01) extends EvictionPolicy[K] {
   private val CMS = new CountMinSketchMonoid(eps, delta, seed, heavyHittersPct)
   private var sketch = CMS.zero
 
-  def chooseVictim(key: K, buffer: Buffer): Option[K] = {
+  private def updateSketch(key: K) {
+    sketch ++= CMS.create(key.hashCode())
+  }
+
+  override def notifyCacheHit(key: K) {
+    updateSketch(key)
+  }
+
+  override def notifyCacheMiss(key: K) {
+    updateSketch(key)
+  }
+
+  override def chooseVictim(key: K, buffer: Buffer): Option[K] = {
+    updateSketch(key)
     // The estimated least frequent key:
     Some(buffer.keysIterator.minBy(key => sketch.frequency(key.hashCode()).estimate))
   }
+
+  override def toString: String = "CountMinSketchEvictionPolicy[eps=" + eps + ", delta=" + delta + "]"
 }
