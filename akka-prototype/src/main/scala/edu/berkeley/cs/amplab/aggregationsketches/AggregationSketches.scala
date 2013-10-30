@@ -19,10 +19,11 @@ object AggregationSketches {
 
     val evictionPolicies = Seq(
       new NoPreAggregationEvictionPolicy[Int],
+      new OptimalEvictionPolicy[Int](items),
       new RandomEvictionPolicy[Int],
       new RandomEvictionPolicy[Int] with BloomFilterInitialBypass[Int] { override def numEntries = maxKey },
-      new CountMinSketchEvictionPolicy[Int](0.1, 0.1),
-      new CountMinSketchEvictionPolicy[Int](0.1, 0.1) with BloomFilterInitialBypass[Int] { override def numEntries = maxKey }
+      new CountMinSketchEvictionPolicy[Int](0.01, 1E-3),
+      new CountMinSketchEvictionPolicy[Int](0.01, 1E-3) with BloomFilterInitialBypass[Int] { override def numEntries = maxKey }
     )
     val stats = evictionPolicies.map(policy => (policy.toString, simulateCountByKey[Int](items, 100, policy)))
     for ((policyName, numOutputTuples) <- stats.sortBy(_._2)) {

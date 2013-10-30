@@ -38,6 +38,8 @@ trait EvictionPolicy[K] {
     * @return the victim, or None to bypass the cache.
     */
   def chooseVictim(key: K, buffer: Buffer): Option[K]
+
+  override def toString: String = getClass.getSimpleName
 }
 
 class NoPreAggregationEvictionPolicy[K] extends EvictionPolicy[K] {
@@ -46,9 +48,6 @@ class NoPreAggregationEvictionPolicy[K] extends EvictionPolicy[K] {
   override def chooseVictim(key: K, buffer: Buffer): Option[K] = {
     throw new UnsupportedOperationException()
   }
-
-  override def toString: String = "NoPreaggregationEvictionPolicy"
-
 }
 
 class RandomEvictionPolicy[K](seed: Long = 42) extends EvictionPolicy[K] {
@@ -58,8 +57,6 @@ class RandomEvictionPolicy[K](seed: Long = 42) extends EvictionPolicy[K] {
     val chosenKey = rand.nextInt(buffer.size)
     Some(buffer.keySet.toIndexedSeq(chosenKey))
   }
-
-  override def toString: String = "RandomEvictionPolicy"
 }
 
 class CountMinSketchEvictionPolicy[K](eps: Double, delta: Double, seed: Int = 42,
@@ -86,4 +83,32 @@ class CountMinSketchEvictionPolicy[K](eps: Double, delta: Double, seed: Int = 42
   }
 
   override def toString: String = "CountMinSketchEvictionPolicy[eps=" + eps + ", delta=" + delta + "]"
+}
+
+/**
+ * Makes optimal eviction decisions, based on Belady's Algorithm.
+ * This technique isn't feasible in practice, because it requires lookahead over the entire stream,
+ * but it serves as a useful lower bound in benchmarks.
+ */
+class OptimalEvictionPolicy[K](stream: Seq[K]) extends EvictionPolicy[K] {
+  private var streamTail = stream
+
+  override def notifyCacheHit(key: K) {
+    streamTail = streamTail.drop(1)
+  }
+
+  override def notifyCacheMiss(key: K) {
+    streamTail = streamTail.drop(1)
+  }
+
+  override def chooseVictim(key: K, buffer: Buffer): Option[K] = {
+    streamTail = streamTail.drop(1)
+    // Evict the key whose next appearance is furthest in the future:
+    def nextUse(key: K) = if (streamTail.contains(key)) {
+      streamTail.indexOf(key)
+    } else {
+      Int.MaxValue
+    }
+    Some(buffer.keysIterator.maxBy(nextUse))
+  }
 }
