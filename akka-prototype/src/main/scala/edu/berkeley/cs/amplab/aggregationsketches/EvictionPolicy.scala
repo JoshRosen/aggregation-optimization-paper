@@ -57,6 +57,8 @@ class RandomEvictionPolicy[K](seed: Long = 42) extends EvictionPolicy[K] {
     val chosenKey = rand.nextInt(buffer.size)
     Some(buffer.keySet.toIndexedSeq(chosenKey))
   }
+
+  override def toString: String = "RandomEvictionPolicy"
 }
 
 class CountMinSketchEvictionPolicy[K](eps: Double, delta: Double, seed: Int = 42,
