@@ -21,6 +21,7 @@ object AggregationSketchesBuild extends Build {
         "org.scalatest" %% "scalatest" % "1.9.2" % "test",
         "com.twitter" % "algebird-core_2.9.3" % "0.3.0",
         "com.google.guava" % "guava" % "15.0",
+        "com.carrotsearch" % "java-sizeof" % "0.0.4",
         "com.bizo" % "mighty-csv_2.9.1" % "0.2"
       )
     )

@@ -1,6 +1,7 @@
 package edu.berkeley.cs.amplab.aggregationsketches
 
 import com.bizo.mighty.csv.CSVWriter
+import com.carrotsearch.sizeof.RamUsageEstimator
 
 object AggregationSketches {
 
@@ -13,10 +14,10 @@ object AggregationSketches {
   }
 
   def main(args: Array[String]) {
-    val numItems = 10000
-    val maxKey = 1000
-    val bufferPercentages = Seq(0.01, 0.05, .10, .25, .50, 1.0)
-    val dataGenerators = Seq(1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7).map{ alpha =>
+    val numItems = 50000
+    val maxKey = 10000
+    val bufferPercentages = Seq(0.01, 0.05)
+    val dataGenerators = Seq(1.1, 1.2, 1.3).map{ alpha =>
       "Zipf (alpha=%s)".format(alpha) -> DataGenerators.zipf(alpha, maxKey = maxKey)
     }.toMap
     // "All Unique" -> DataGenerators.countFrom(1)
@@ -24,7 +25,7 @@ object AggregationSketches {
 
     val output = CSVWriter(System.out)
     // Outputs results as TSV, which can be pasted into Excel for analysis:
-    val columnNames = Seq("Data Set", "Num Items", "Fraction Buffered", "Output Size", "Time (ms)", "Eviction Strategy")
+    val columnNames = Seq("Data Set", "Num Items", "Fraction Buffered", "Output Size", "Time (ms)", "Extra Space Usage (Bytes)", "Eviction Strategy")
     output.write(columnNames)
 
     for ((generatorName, generator) <- dataGenerators;
@@ -38,17 +39,22 @@ object AggregationSketches {
         new LRUEvictionPolicy[Int](bufferSize),
         new FIFOEvictionPolicy[Int],
         new RandomEvictionPolicy[Int] with BloomFilterInitialBypass[Int] { override def numEntries = maxKey },
+        new RandomEvictionPolicy[Int] with BloomFilterInitialBypassWithPeriodicReset[Int],
         new CountMinSketchEvictionPolicy[Int](0.01, 1E-3),
         new CountMinSketchEvictionPolicy[Int](0.01, 1E-3) with BloomFilterInitialBypass[Int] { override def numEntries = maxKey }
       )
+
       val stats = evictionPolicies.iterator.map { policy =>
+        System.gc()
         val startTime = System.currentTimeMillis()
         val numOutputTuples = simulateCountByKey[Int](items, bufferSize, policy)
-        (policy.toString, numOutputTuples, System.currentTimeMillis() - startTime)
+        val endTime = System.currentTimeMillis()
+        val policySize = RamUsageEstimator.sizeOf(policy)
+        (policy.toString, numOutputTuples, endTime - startTime, policySize)
       }
 
-      for ((policyName, numOutputTuples, time) <- stats) {
-        output.write(Seq(generatorName, numItems, bufferPct, numOutputTuples, time, policyName).map(_.toString))
+      for ((policyName, numOutputTuples, time, policySize) <- stats) {
+        output.write(Seq(generatorName, numItems, bufferPct, numOutputTuples, time, policySize, policyName).map(_.toString))
         output.flush()
       }
     }
