@@ -119,8 +119,14 @@ class CountMinSketchEvictionPolicy[K](eps: Double, delta: Double, seed: Int = 42
 
   override def chooseVictim(key: K, buffer: Buffer): Option[K] = {
     updateSketch(key)
-    // The estimated least frequent key:
-    Some(buffer.keysIterator.minBy(key => sketch.frequency(key.hashCode()).estimate))
+    val leastFrequentKey = buffer.keysIterator.minBy(k => sketch.frequency(k.hashCode()).estimate)
+    val minKeyFrequency = sketch.frequency(leastFrequentKey.hashCode())
+    val newKeyFrequency = sketch.frequency(key.hashCode())
+    if (newKeyFrequency.estimate >= minKeyFrequency.estimate) {
+      Some(leastFrequentKey)
+    } else {
+      None
+    }
   }
 
   override def toString: String = "CountMinSketchEvictionPolicy[eps=" + eps + ", delta=" + delta + "]"
