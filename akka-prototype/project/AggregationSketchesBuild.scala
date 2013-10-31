@@ -19,7 +19,8 @@ object AggregationSketchesBuild extends Build {
       ),
       libraryDependencies ++= Seq(
         "org.scalatest" %% "scalatest" % "1.9.2" % "test",
-        "com.twitter" % "algebird-core_2.9.3" % "0.3.0"
+        "com.twitter" % "algebird-core_2.9.3" % "0.3.0",
+        "com.bizo" % "mighty-csv_2.9.1" % "0.2"
       )
     )
   )
