@@ -61,6 +61,45 @@ class RandomEvictionPolicy[K](seed: Long = 42) extends EvictionPolicy[K] {
   override def toString: String = "RandomEvictionPolicy"
 }
 
+class FIFOEvictionPolicy[K] extends EvictionPolicy[K] {
+  private val queue = new mutable.Queue[K]()
+
+  override def notifyCacheMiss(key: K) {
+    queue += key
+  }
+  override def chooseVictim(key: K, buffer: Buffer): Option[K] = {
+    queue += key
+    val victim = queue.dequeue()
+    assert(buffer.contains(victim))
+    Some(victim)
+  }
+
+  override def toString: String = "FIFOEvictionPolicy"
+}
+
+class LRUEvictionPolicy[K](bufferSize: Int) extends EvictionPolicy[K] {
+  private val map = new java.util.LinkedHashMap[K, Int](bufferSize, 0.75f, true)
+
+  override def notifyCacheMiss(key: K) {
+    map.put(key, 1)
+  }
+
+  override def notifyCacheHit(key: K) {
+    map.put(key, 1)
+  }
+
+  override def chooseVictim(key: K, buffer: Buffer): Option[K] = {
+    map.put(key, 1)
+    val iterator = map.entrySet().iterator()
+    val victim = iterator.next().getKey
+    iterator.remove()
+    assert(buffer.contains(victim))
+    Some(victim)
+  }
+
+  override def toString: String = "LRUEvictionPolicy"
+}
+
 class CountMinSketchEvictionPolicy[K](eps: Double, delta: Double, seed: Int = 42,
                                       heavyHittersPct: Double = 0.01) extends EvictionPolicy[K] {
   private val CMS = new CountMinSketchMonoid(eps, delta, seed, heavyHittersPct)

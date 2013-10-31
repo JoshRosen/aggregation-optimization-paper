@@ -30,6 +30,8 @@ object AggregationSketches {
         new NoPreAggregationEvictionPolicy[Int],
         new OptimalEvictionPolicy[Int](items),
         new RandomEvictionPolicy[Int],
+        new LRUEvictionPolicy[Int](bufferSize),
+        new FIFOEvictionPolicy[Int],
         new RandomEvictionPolicy[Int] with BloomFilterInitialBypass[Int] { override def numEntries = maxKey },
         new CountMinSketchEvictionPolicy[Int](0.01, 1E-3),
         new CountMinSketchEvictionPolicy[Int](0.01, 1E-3) with BloomFilterInitialBypass[Int] { override def numEntries = maxKey }
