@@ -7,7 +7,7 @@ import com.twitter.algebird.CountMinSketchMonoid
 
 abstract class BufferingPreAggregator[K, V](
                                              bufferSize: Int,
-                                             nextAgg: Aggregator[K, V],
+                                             val nextAgg: Aggregator[K, V],
                                              aggFunc: (V, V) => V) extends Aggregator[K, V] {
 
   protected val buffer: mutable.Map[K, V]
@@ -40,6 +40,12 @@ abstract class BufferingPreAggregator[K, V](
     flush()
     nextAgg.flush()
     nextAgg.close()
+  }
+
+  override def memoryUsageInBytes: Long = {
+    // A back-of-the-envelope estimate, from
+    // http://java-performance.info/memory-consumption-of-java-data-types-2/
+    (32 * 4) * bufferSize
   }
 }
 
@@ -111,5 +117,10 @@ extends BufferingPreAggregator[K, V](bufferSize, nextAgg, aggFunc) {
     } else {
       nextAgg.send(tuple)
     }
+  }
+
+  override def memoryUsageInBytes: Long = {
+    val BYTES_IN_LONG = 8
+    super.memoryUsageInBytes + (sketch.width * sketch.depth) * BYTES_IN_LONG
   }
 }

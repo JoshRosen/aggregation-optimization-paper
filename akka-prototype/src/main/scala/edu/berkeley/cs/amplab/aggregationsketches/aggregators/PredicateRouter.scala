@@ -4,7 +4,8 @@ package edu.berkeley.cs.amplab.aggregationsketches.aggregators
 /**
  * Routes tuples to one of two aggregators depending on the value of a predicate.
  */
-abstract class PredicateRouter[K, V](onTrue: Aggregator[K, V], onFalse: Aggregator[K, V]) extends Aggregator[K, V] {
+abstract class PredicateRouter[K, V](val onTrue: Aggregator[K, V], val onFalse: Aggregator[K, V])
+  extends Aggregator[K, V] {
   def predicate(tuple: (K, V)): Boolean
 
   final def send(tuple: (K, V)) {

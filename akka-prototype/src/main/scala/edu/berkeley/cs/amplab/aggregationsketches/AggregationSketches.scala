@@ -17,7 +17,8 @@ object AggregationSketches {
 
     val output = CSVWriter(System.out)
     // Outputs results as TSV, which can be pasted into Excel for analysis:
-    val columnNames = Seq("Data Set", "Num Items", "Output Size", "Time (ms)", "Extra Space Usage (Bytes)", "Eviction Strategy")
+    val columnNames = Seq("Data Set", "Num Items", "Output Size", "Time (ms)",
+      "RamUsageEstimator (Bytes)", "Back-of-envelope memory usage (Bytes)", "Aggregation Plan")
     output.write(columnNames)
 
     for ((generatorName, generator) <- dataGenerators) yield {
@@ -69,11 +70,11 @@ object AggregationSketches {
         val aggregatorMemoryUsage = RamUsageEstimator.sizeOf(plan)
         plan.rootAggregator.close()
         val outputSize = plan.sinkAggregator.asInstanceOf[CountAggregator].getCount
-        (plan.name, outputSize, endTime - startTime, aggregatorMemoryUsage)
+        (plan, outputSize, endTime - startTime, aggregatorMemoryUsage)
       }
 
-      for ((policyName, numOutputTuples, time, policySize) <- stats) {
-        output.write(Seq(generatorName, numItems, numOutputTuples, time, policySize, policyName).map(_.toString))
+      for ((plan, numOutputTuples, time, policySize) <- stats) {
+        output.write(Seq(generatorName, numItems, numOutputTuples, time, policySize, plan.memoryUsageInBytes, plan.name).map(_.toString))
         output.flush()
       }
     }

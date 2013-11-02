@@ -13,4 +13,5 @@ class CountAggregator extends Aggregator[Any, Any] {
 
   def close() {}
 
+  def memoryUsageInBytes: Long = 0L
 }
