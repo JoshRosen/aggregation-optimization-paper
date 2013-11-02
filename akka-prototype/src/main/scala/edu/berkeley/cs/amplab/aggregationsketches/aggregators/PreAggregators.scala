@@ -80,7 +80,11 @@ protected abstract class LinkedHashMapBufferingPreAggregator[K, V](bufferSize: I
     nextAgg.send((evictedKey, evictedValue))
     bufferPair(tuple)
   }
-}
+
+  override def memoryUsageInBytes: Long = {
+    val SIZEOF_POINTER = 4
+    super.memoryUsageInBytes + bufferSize * SIZEOF_POINTER  // Space for the link pointers
+  }}
 
 class FIFOBufferingPreAggregator[K, V](bufferSize: Int, nextAgg: Aggregator[K, V])(implicit aggFunc: (V, V) => V)
   extends LinkedHashMapBufferingPreAggregator[K, V](bufferSize, nextAgg,
