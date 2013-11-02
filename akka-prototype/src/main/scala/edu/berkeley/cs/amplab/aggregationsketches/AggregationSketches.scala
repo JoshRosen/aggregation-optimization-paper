@@ -2,22 +2,14 @@ package edu.berkeley.cs.amplab.aggregationsketches
 
 import com.bizo.mighty.csv.CSVWriter
 import com.carrotsearch.sizeof.RamUsageEstimator
+import edu.berkeley.cs.amplab.aggregationsketches.aggregators._
 
 object AggregationSketches {
 
-  def simulateCountByKey[K](stream: TraversableOnce[K], bufferSize: Int, policy: EvictionPolicy[K]): Int = {
-    val writer = new CountingOutputWriter
-    val aggregator = new Aggregator[K, Int, Int](bufferSize, policy, writer, x => x, _ + _, _ + _)
-    aggregator.aggregateStream(stream.map(x => (x, 1)))
-    aggregator.close()
-    writer.getCount
-  }
-
   def main(args: Array[String]) {
-    val numItems = 50000
-    val maxKey = 10000
-    val bufferPercentages = Seq(0.01, 0.05)
-    val dataGenerators = Seq(1.1, 1.2, 1.3).map{ alpha =>
+    val numItems = 20000
+    val maxKey = 40000
+    val dataGenerators = Seq(1.3).map{ alpha =>
       "Zipf (alpha=%s)".format(alpha) -> DataGenerators.zipf(alpha, maxKey = maxKey)
     }.toMap
     // "All Unique" -> DataGenerators.countFrom(1)
@@ -25,36 +17,63 @@ object AggregationSketches {
 
     val output = CSVWriter(System.out)
     // Outputs results as TSV, which can be pasted into Excel for analysis:
-    val columnNames = Seq("Data Set", "Num Items", "Fraction Buffered", "Output Size", "Time (ms)", "Extra Space Usage (Bytes)", "Eviction Strategy")
+    val columnNames = Seq("Data Set", "Num Items", "Output Size", "Time (ms)", "Extra Space Usage (Bytes)", "Eviction Strategy")
     output.write(columnNames)
 
-    for ((generatorName, generator) <- dataGenerators;
-         bufferPct <- bufferPercentages) yield {
-      val bufferSize = math.round(numItems * bufferPct).toInt
+    for ((generatorName, generator) <- dataGenerators) yield {
       val items = generator.take(numItems)
-      val evictionPolicies = Seq(
-        new NoPreAggregationEvictionPolicy[Int],
-        new OptimalEvictionPolicy[Int](items),
-        new RandomEvictionPolicy[Int],
-        new LRUEvictionPolicy[Int](bufferSize),
-        new FIFOEvictionPolicy[Int],
-        new RandomEvictionPolicy[Int] with BloomFilterInitialBypass[Int] { override def numEntries = maxKey },
-        new RandomEvictionPolicy[Int] with BloomFilterInitialBypassWithPeriodicReset[Int],
-        new CountMinSketchEvictionPolicy[Int](0.01, 1E-3),
-        new CountMinSketchEvictionPolicy[Int](0.01, 1E-3) with BloomFilterInitialBypass[Int] { override def numEntries = maxKey }
+      val numUniqueKeys = items.toSet.size
+      implicit def aggregationFunction(a: Int, b: Int): Int = a + b
+      val aggregationPlans: Seq[AggregationPlan[Int, Int]] = Seq(
+        {
+          val sink = new CountAggregator
+          val root = new RandomBufferingPreAggregator[Int, Int](numItems, sink)
+          new AggregationPlan("Complete pre-aggregation", root, sink)
+        },
+        {
+          val sink = new CountAggregator
+          new AggregationPlan("No pre-Aggregation", sink, sink)
+        },
+        {
+          val sink = new CountAggregator
+          val root = new LRUBufferingPreAggregator[Int, Int](math.round(0.01f * numUniqueKeys), sink)
+          new AggregationPlan("1% LRU Buffer", root, sink)
+        },
+        {
+          val sink = new CountAggregator
+          val lru = new LRUBufferingPreAggregator[Int, Int](math.round(0.01f * numUniqueKeys), sink)
+          val root = new BloomFilterRouter[Int, Int](1000, 0.01f, 0.5f)(lru, sink)
+          new AggregationPlan("1000-key Bloom Filter + 1% LRU Buffer", root, sink)
+        },
+        {
+          val sink = new CountAggregator
+          val root = new CountMinSketchBufferingPreAggregator[Int, Int](0.01, 1E-3)(math.round(0.01f * numUniqueKeys), sink)
+          new AggregationPlan("1% CMS Buffer", root, sink)
+        },
+        {
+          val sink = new CountAggregator
+          val root = new FIFOBufferingPreAggregator[Int, Int](math.round(0.01f * numUniqueKeys), sink)
+          new AggregationPlan("1% FIFO Buffer", root, sink)
+        }
       )
 
-      val stats = evictionPolicies.iterator.map { policy =>
+      val stats = aggregationPlans.iterator.map {plan =>
         System.gc()
         val startTime = System.currentTimeMillis()
-        val numOutputTuples = simulateCountByKey[Int](items, bufferSize, policy)
+        items.map((_, 1)).foreach(plan.rootAggregator.send)
         val endTime = System.currentTimeMillis()
-        val policySize = RamUsageEstimator.sizeOf(policy)
-        (policy.toString, numOutputTuples, endTime - startTime, policySize)
+        // For now, measure memory usage before the final close() call.
+        // We'll probably want to remove this code if we want exact timing measurements in pipelines with
+        // large initial buffers (or a set of custom methods for recursively determining the memory usage
+        // of a plan, normalized in units of buffer space.
+        val aggregatorMemoryUsage = RamUsageEstimator.sizeOf(plan)
+        plan.rootAggregator.close()
+        val outputSize = plan.sinkAggregator.asInstanceOf[CountAggregator].getCount
+        (plan.name, outputSize, endTime - startTime, aggregatorMemoryUsage)
       }
 
       for ((policyName, numOutputTuples, time, policySize) <- stats) {
-        output.write(Seq(generatorName, numItems, bufferPct, numOutputTuples, time, policySize, policyName).map(_.toString))
+        output.write(Seq(generatorName, numItems, numOutputTuples, time, policySize, policyName).map(_.toString))
         output.flush()
       }
     }
