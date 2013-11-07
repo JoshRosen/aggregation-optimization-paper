@@ -21,7 +21,7 @@
 
 Aggregate-by-key is a common and often expensive operation in ``big data'' frameworks like MapReduce and Spark.
 
-There are many techniques to optimize these aggregations, including multi-level aggregation techniques, like aggregation trees, and pre-aggregation techniques, like Hadoop and Spark's map-side combiners.
+There are many ways to optimize these aggregations, including multi-level aggregation techniques, like aggregation trees, and pre-aggregation techniques, like Hadoop and Spark's map-side combiners.
 The aggregation operator's performance is sensitive to skew in its input data properties, such as uneven frequencies of aggregation keys or an uneven partitioning of the keyspace across machines.
 Its performance can also be order-sensitive; for example, pre-aggregation schemes benefit from ``clusteredness'' in their input data, when values with the same key appear close together in the stream.
 
@@ -218,63 +218,107 @@ Again, we're faced with a trade-off: if we maintain a list of records with poor 
 
 
 
+\pagebreak
+\section{Optimizing Aggregation Pipelines}
+Many of the optimizations sketched above can be composed to form complex
+aggregation pipelines.  For example, ``selective bypass'' can be generalized
+into content/frequency-based routing of aggregation inputs to different
+aggregators.  Similarly, we can build several layers of pre-aggregators with
+different buffer sizes, eviction policies, and numbers of input source,
+implementing more complex types of multi-level aggregation.
 
-\section{Cost Model for Aggregation Queries}
+We can implement these compositions as networks of stateful, push-based
+aggregation operators.
 
-In this section, we'll develop a cost model for understanding the trade-offs
-in different aggregation schemes.
+\subsection{Bloom Filter Bypass for Unique Keys}
+Unique keys won't benefit from pre-aggregation, so if we know that a key is
+unique, we should prefer to forward it rather than having it contribute
+towards the eviction of a more common key that may actually benefit from
+pre-aggregation.
 
-We have a dataset $D$ with $|D|$ key-value pairs, with $k$ distinct keys.
-Assume that each key-value pair require one unit of memory.
-This dataset is partitioned across $m$ machines.
+The challenge is in identifying unique keys while using a minimal amount of
+space.  Bloom filters can help here: if we look up all incoming keys in
+a Bloom filter, we can bypass the pre-aggregation for the first occurrence of
+any key.  This approach has two limitations: false-positives may cause
+a unique key to be pre-aggregated, and we may need a large Bloom filter to
+achieve a low false positive rate when processing a dataset with many unique
+keys.
 
-Assume that the machines are connected by a flat network that behaves
-approximately linearly, transmitting $p$ key-value pairs in $\max(N * p,
-N_{\min})$ units of time, where $N_{\min}$ accounts for fixed overheads when
-sending small messages.
+To address these limitations, we can consider using a small Bloom filter that's
+periodically cleared once a certain fraction of its bits are set (or,
+equivalently, when the expected false positive probability exceeds some
+threshold).  For unique keys, this approach will lower the false positive
+probability, but it may lead to false negatives for non-unique keys.
+We can avoid those false negatives by re-inserting the aggregation buffer's
+keys into the Bloom filter after clearing it.
 
-We'll also assume that networking has a negligible CPU overhead, so it's
-possible to maximize both network utilization and useful CPU work.
+% TODO: discuss appropriate sizing of the Bloom filter as a function of the
+% cache size.
 
-Let $H$ be the time cost of a hashtable lookup or insertion and $A$ be the
-cost of applying the aggregation function to a pair of values.
+Informally, we can see that this is beneficial by considering pre-aggregation
+over an infinite stream with an infinite number of unique keys and an infinite
+number of reappearances of non-unique keys.  A finite Bloom filter will
+eventually fill up and become useless due to the infinite number of unique
+keys, while periodically clearing it avoids this.
 
-\subsection{No Pre-aggregation}
+We can explore this formally, too.
 
-Executing a reduce-by-key with no pre-aggregation requires us to shuffle the
-entire dataset.  With no skew and no pipelining, this takes time 
+Given a key frequency distribution, a Bloom filter for cache bypassing, and
+a fixed-size pre-aggregation cache, we'd like to calculate the output key
+frequency distribution, assuming as input an infinite stream of random samples
+from our input distribution.
+
+Since the output shrinks at each stage and no new keys are created, the key
+frequency distribution becomes progressively flatter until, in the final
+aggregation stage, it becomes a uniform distribution.
+
+%To avoid boundary cases, assume that the cache is always full, so any cache
+%miss will trigger an eviction.
+
+%Consider the interarrival times for kys in the input distribution.  Let
+%$d_k(i)$ be the probability that key $k$ appears $i$ entries after its last
+%appearance.
+
+%We can compute the interarrivial times for output keys.
+
+Keys appear in the output because they either missed the Bloom filter and
+bypassed the cache, or were evicted from the cache by other keys.  Let
+$d_k(t)$ be the probability that key appears at time $t$:
 \[
-    |D| * (N + H + A).
-\]
-We can interleave the aggregation and shuffle steps, improving
-this to at best $|D| * N$ if we're network bound.
-
-\subsection{Complete Pre-aggregation}
-
-With complete pre-aggregation, we pay for extra pre-shuffle hashtable
-operations, but potentially transfer less data over the network.  If
-pre-aggregation reduces data size at worst a factor of $r$, then
-the total aggregation cost is
-\[
-    |D| * (N/r + (1 + 1/r)H + A).
+    d_k(t) = P\left(\text{misses Bloom filter}\right)
+                +
+             P\left(\text{hits BloomFilter}\right)
+             P\left(\text{not in cache}\right)
 \]
 
-\subsection{Plugging in Real Numbers}
+The probability that a key was evicted from the cache between arrivals can be
+calculated from its iterarrival rate in the input stream.  If a key has an
+interarrival rate of $n$, then there were $n$ opportunities for it to be
+evicted.  If the key remained in the cache, then for every one of those $n$
+arrivals either the other keys hit the cache, missed the Bloom filter, or
+missed the cache and evicted another key:
 
-\textbf{TODO:} Look up (or measure) realistic values for these constants in
-a system like Spark.
+\begin{align*}
+    P\left(\text{arrival evicts a particular key}\right)
+    &=  P\left(\text{misses Bloom filter}\right) + \\
+    &
+    P\left(\text{hits Bloom filter}\right)
+    \left(
+        P\left(\text{hits cache}\right)
+        + P\left(\text{misses cache}\right)P\left(\text{evicts other key}\right)
+    \right)
+    \\
+\end{align*}
 
-
-
-
-
+To calculate this, we need to know the overall probabilities of cache hits or
+misses.
 
 
 
 
 \pagebreak
 
-\section{Recovery}
+\section{Fault-Tolerance and Recovery}
 
 \emph{(This idea is more general, but I'm just using Spark as an example)}
 
@@ -302,128 +346,8 @@ because statistics generated during query execution might suggest that an
 alternative plan would be faster.
 
 
-\pagebreak
-\section{Optimizations for Skewed Data}
-
-\cite{perf-eval-heavy-tail} describes several applications in networking,
-load-balancing, and scheduling where awareness of skewed data distribution
-enables optimizations.
-
-These optimizations usually work by identifying the most popular keys or data
-elements and processing them differently.
-
-\textbf{TODO:} talk about how this trick can be used to adaptively apply many
-other types of aggregation optimizations (e.g. shared and synchronized (or
-CAS) data structures for infrequent, long-tailed keys, and separate,
-cache-locality-preserving structures for the popular keys).
-
-%\subsection{Machine Learning}
-
-%Skew in machine learning: skew can cause problems for classification tasks.
-%For example, in fraud detection systems, most transactions are not
-%fraudulent, so a naive algorithm that always says ``not fraudulent'' will be
-%correct most of the time
-%(http://dl.acm.org/citation.cfm?id=1007730.1007738).  In practice,
-%techniques can be used to address the imbalance in the underlying data, such
-%as performing biased sampling so the fraudulent training examples will be
-%weighted more heavily.
-
-\subsection{Join Queries}
-
-There are several join optimizations for skewed data.  For example,
-\cite{smj-skew-optmization} modifies sort-merge join to devote more resources
-to processing popular keys.
-% TODO: I need to read through the SMJ optimization papers in more detail.
-
-Apache Hive \cite{hive-join-strategies} employs a scheme that uses
-a shuffle-based join for most keys, but defers joins for the extremely
-frequent keys.  These keys are joined in a separate map-join phase.  This
-approach prevents a single popular key from bottlenecking at a single reducer.
-
-% Skew Handling Techniques in Sort-Merge Joins: http://www.cs.arizona.edu/people/dgao/pub/skew.pdf
-
-% In the AQP survey framework, this is an adaptive technique that's based on \emph{horizontal partitioning}, picking different traditional query plans for disjoint portions of the query's data.
 
 \pagebreak
-\section{Analysis}
-
-\subsection{Payoffs in terms of data properties}
-
-\subsection{Characterization of optimal and default strategies}
-
-\subsection{Permutations of local data}
-
-Consider a data set of $n$ key-value pairs, with $k$ distinct keys.
-
-Assume that keys are drawn from a Zipf distribution with parameter $\alpha$.
-Using complete pre-aggregation on data drawn from this distribution, what's the best-case reduction of tuples in the input to the final aggregation phase?
-For large values of $\alpha$, the keys are sampled uniformly, so each key appears roughly $n/k$ times and complete pre-aggregation reduces the final reducer's input by a factor of $n/k$.
-At the other extreme, a small $\alpha$ produces a handful of popular keys and a long tail of unique or infrequent keys.
-
-Actually, complete pre-aggregation always reduces the size by a factor of $n/k$, since we output exactly one tuple for each of the $k$ keys.
-
-%To be precise, if key $i$ appears with frequency $d_i$, then complete pre-aggregation outputs exactly $k$ tuples, one per key, saving
-%\[
-%    \sum_{i=1}^k \min \left(d_i - 1, 0\right) = 
-%\]
-
-If we draw keys from this Zipf distribution, what's the expected number of unique keys that are assigned to each of $m$ machines?
-\begin{align*}
-    E[X|\alpha] &= \sum_{k=1}^K E[I(k, d_k) | \alpha]
-\\              &= \sum_{k=1}^K \sum_{d=1}^K \left(1 - \left(1 - 1/m\right)^d\right)p(d | \alpha)
-\\              &= k \sum_{k=1}^K\left(1 - p\left(\text{all copies of $k$ are assigned to other machines}\right)\right) p(d | \alpha)
-\end{align*}
-
-What's the maximum number of unique keys that could be assigned to one machine?  In principle, all keys could appear on one machine, so we'll look at the distribution of the maximum number of keys per machine.
-
-
-\pagebreak
-\section{Tricks}
-
-\subsection{Affinity Routing}
-
-\subsection{Multi-level aggregation with eviction and skip levels}
-
-\subsection{Sketching for frequent values}
-
-
-\section{Adaptivity}
-
-The optimal aggregation strategy depends on the number of groups and their
-distribution across nodes.
-For example, it only makes sense to use Combiners in MapReduce when the number of groups is small.
-Using global statistics, we could try to estimate the number of groups to decide whether to use combiners.
-Alternatively, we can use adaptive aggregation algorithms that allow individual nodes to pick their aggregation strategies based on the properties of their local input data \cite{adaptive-aggregation}.
-
-% TODO: borrowing from other AQP work, maybe we could use only a sample of the input stream to maintain hit rate statistics.
-
-\section{Order Sensitivity}
-Preaggregation techniques are sensitive to the arrival order of tuples.  With partial preaggregation, for example, the output size may be minimal if the tuples arrive in sorted order, but can be much larger with other orderings \cite{partial-preaggregation}.
-
-When analyzing the expected output reduction due to partial preaggregation, \cite{partial-preaggregation} assumes that input records arrive in a random order (i.e. their groups are randomly sampled from some (possibly-skewed) distribution).
-
-Fully-sorted input will achieve optimal aggregation performance, but partially-sorted orders are still interesting to analyze.  Often, real-world data exhibits temporal clustering; for example, interaction data from a single user's shopping session is likely to be close together in a clickstream log.  To analyze these cases, \cite{estimating-cardinality} introduces a \emph{clusteredness} measurement and explores its impact on the performance of partial preaggregation algorithms.  The clusteredness metric considers only the clustering of input groups and not their relative sort orderings.
-
-\subsection{Clusteredness}
-
-Find the positions where the group changes.  Add these up and exclude the first appearance of each group.  Then, perfectly clustered data has zero changes.  By itself, this is an insufficient measure of clusteredness because it doesn't consider \emph{which} groups we're changing between (e.g. cycling between a few groups vs. changing uniformly at random).  So, we extend this to incorporate the average number of changes until members of the same group are seen.  In short, the clusteredness ``expresses the average number of changes between the appearance of two identical grouping values.''  A clusteredeness of $d$ means that, on average, $d$ group changes will occur until a group is re-encountered.
-
-
-\textbf{Distance classes:} distances between appearances may have high variance, so we replace a single average $d$ with a set of average distances over different ranges (this is like creating a histogram using more bins).
-
-\textbf{Group classes:} ???
-
-The paper doesn't explore how to efficiently compute the clusteredness, so I'm doubtful of this technique's usefulness in practice.
-
-% TODO
-\textbf{Question}: what's the actual clusteredness of real data sets?  Can we compute this and just report some empirical results, since these would establish more realistic bounds for real problem instances?
-
-\subsection{Bounds}
-
-\cite{estimating-cardinality}
-Randomized replacement represents an upper bound on the output size; eviction using lookahead gives a lower bound, even though it's impossible to implement in practice.
-
-
 \bibliographystyle{plain}
 \bibliography{aggregation}
 
