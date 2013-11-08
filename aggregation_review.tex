@@ -11,7 +11,7 @@
 
 \setcounter{secnumdepth}{0} % supresss section numbers
 
-\title{Aggregation Optimizations}
+\title{Aggregation Optimizations for Skewed Data}
 \author{Josh Rosen}
 
 \begin{document}
@@ -19,19 +19,51 @@
 
 \section{Introduction}
 
-Aggregate-by-key is a common and often expensive operation in ``big data'' frameworks like MapReduce and Spark.
+Aggregate-by-key is a common (and often expensive) operation in ``big data''
+frameworks like MapReduce and Spark.
+%
+There are many ways to optimize aggregation, including multi-level
+aggregation techniques, like aggregation trees, and pre-aggregation
+techniques, like Hadoop and Spark's map-side combiners.
 
-There are many ways to optimize these aggregations, including multi-level aggregation techniques, like aggregation trees, and pre-aggregation techniques, like Hadoop and Spark's map-side combiners.
-The aggregation operator's performance is sensitive to skew in its input data properties, such as uneven frequencies of aggregation keys or an uneven partitioning of the keyspace across machines.
-Its performance can also be order-sensitive; for example, pre-aggregation schemes benefit from ``clusteredness'' in their input data, when values with the same key appear close together in the stream.
+As a framework for analyzing these optimizations, we can view aggregators as
+functions whose output key distributions are ``flattened'' versions of their
+input key distributions.  The degree of this flattening depends on the aggregation
+technique and properties of the input data, such as clusteredness or skew.
 
-All of these optimizations involve trade-offs between latency, memory, network usage, and processor time, so the optimal aggregation technique is a function of the data properties and these resources' relative costs.
-It's also interesting to consider how adaptive query processing techniques might be applied to aggregation in a streaming setting.
+For example, a buffering aggregator with unlimited buffer space produces
+uniform output key distribution for any input distribution.  A pre-aggregator
+with finite buffer space may leave the key distribution untouched in the worst
+case, or may achieve perfect flattening in the best case.
 
-The rest of this report summarizes related work in aggregation optimization, proposes some new optimizations, and explores issues related to aggregation and lineage-based fault-tolerance.
+\subsection{Analysis Framework}
+
+In our analysis, an \emph{aggregator} is a component that receives an input
+stream of (key, value) pairs and produces an output stream of (key, aggregate)
+pairs.  Let each input key $k$ be randomly sampled with replacement
+from a discrete distribution $p_{in}(k)$.  The aggregator's behavior defines
+a distribution over output sizes and output key distributions $p_{out}(k)$.
+The output key distribution is guaranteed to be at least as uniform as the
+input distribution.
+
+As an example, an aggregator with unlimited buffer space produces output whose
+size is equal to the number of distinct keys in its input and whose key
+distribution is uniform.
+
+Because the inputs and outputs of aggregators are both modeled as key
+frequency and output size distributions, we can use conditional probability to
+analyze the composition of two aggregators.
+
+Even though we are modeling distributed aggregate-by-key, our analysis will
+only focus on the final output produced by a particular reducer.  Reducers
+operate on disjoint sets of keys; if we assume that all reducers are
+responsible for the same number of distinct keys (a reasonable assumption when
+using hash-partitioning), then we can model the complete aggregation
+by combining the independent analyses of the individual reducers.
 
 \section{Multi-level Aggregation}
 
+As our first case-study, we'll explore aggregation trees.
 Multi-level aggregation techniques, such aggregation trees, can address
 several problems:
 
@@ -61,8 +93,101 @@ several problems:
 
 Hierarchical aggregation may harm performance if it achieves a low reduction
 in network bandwidth. For example, a binary aggregation tree will cause
-a logarithmic increase in execution time if the intermediate aggregations
-don't reduce the data volume.
+a logarithmic increase in execution time if the intermediate aggregators
+produce output that's same size as their input.
+
+Given $m$ machines each producing $K$ keys, what's the optimal fan-in for an
+aggregation tree that produces a final aggregate at its root?  The maximum
+fan-in, $m$, is equivalent to sending all keys to the root.  The minimum
+fan-in, 2, produces a binary aggregation tree.
+
+Assume that the leaves of the aggregation tree perform no local combining.
+If our goal is to minimize communication, $m$ is the optimal fan-in.
+Minimizing the total time to produce the final aggregate is more complicated.
+The end-to-end time is determined by the sum of the maximum completion times
+at each level of the aggregation tree.  Let $|a_{out}|$ be the number of
+records output by aggregator $a$.  If we assume that the network behaves
+linearly and each aggregator spends one unit of processing and communication
+time per input record, then with a fan-in of $f$ the end-to-end time is
+\[
+    \sum_{l=1}^{\lceil\log_fm\rceil}
+        \max
+        \left(
+            |a_{out}| | a \in \text{ level } l
+        \right)
+\]
+If aggregators perform complete aggregation over their inputs, their output
+size is the number of unique keys in their inputs.
+
+When the dataset contains only one key, a fan-in of $f$ produces a tree
+where each level takes $f$ units of time to complete, for a total time of
+\[
+    f \log_f m,
+\]
+which is minimized by $f = e$.  Since $f$ must be discrete, the optimal fan-in
+is $f = 3$, because $3 \log_3 m \leq 2 \log_2 m$ for $m > 1$.
+
+In a more general case, the input dataset's keys could be drawn from
+a distribution $p(k)$.  The $m$ leaves of the aggregation trees draw
+independent random samples of size $K$ from this distribution.
+
+The output size of a first level aggregator is
+\[
+   X =
+   \left|
+        \bigcup_{a=1}^f a_{out}
+   \right|
+   ,
+\]
+which is also the number of unique items picked when drawing $\sum_{a=1}^f
+|a_{out}|$ keys with replacement from the input key distribution.
+% http://math.stackexchange.com/questions/180456/proving-a-statement-on-the-probabilty-of-drawing-distinct-items
+% gives the probability distribution of X as
+% Prob(d|k,N) = (1/N^k) N!/(N−d)!S(k,d)
+% where we draw d distinct items in a sample with replacement of size k from
+% a set of size N, and S is a Stirling number of the second kind.
+
+% My own WIP on a derivation:
+
+%This can be rewritten as
+%\[
+    %X =
+    %\sum_{k=1}^{\text{num keys}}
+        %(Y_k - 1),
+%\]
+%where $Y_k = 1$ if $k$ did \emph{not} appear in the sample and $0$ otherwise.
+%We have that
+%\[
+    %P(Y_k = 1) = (1 - p(k))^K
+%\]
+
+It's interesting to note that the probability of receiving a particular key is
+the same at every level (since we never drop keys); the only thing that changes
+is the number of distinct keys observed by any reducer.  A reducer receives
+the unique keys received by its immediate parents, which is a random sample of
+the distinct keys received at its parents' level.
+
+
+\textbf{TODO: I'd like to complete the above analysis, but for now it's
+interesting to look at what happens when we a distribution over the reduction
+in input size at each level:}
+
+Let $r(f)$ be the output size a reducer given that it receives $f$ inputs.
+Before, $P(r(f) = 1) = 1$.  Now, let $r(f)$ have some discrete probability
+distribution.
+
+The end-to-end aggregation time is
+\[
+    \sum_{l=1}^{\lceil\log_fm\rceil}
+        \max
+        \left(
+            |a_{out}| | a \in \text{ level } l
+        \right)
+\]
+
+
+\pagebreak
+\pagebreak
 
 \subsection{Aggregation on Multiprocessor Machines}
 
