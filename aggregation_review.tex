@@ -131,59 +131,54 @@ In a more general case, the input dataset's keys could be drawn from
 a distribution $p(k)$.  The $m$ leaves of the aggregation trees draw
 independent random samples of size $K$ from this distribution.
 
-The output size of a first level aggregator is
+The unconditional probability of receiving
+a particular key is the same at every level (since we never drop keys); the
+only thing that changes is the number of distinct keys observed by any
+reducer.  A reducer receives the unique keys received by its immediate
+parents, which is a random subset of the set of distinct keys received at its
+parents' level.
+
+For uniformity, let each leaf node output a uniform random sample of size
+$K$ drawn from the input key distribution.  Each aggregator at the next
+level of the tree receives $f$ of these size-$K$ samples as input.  Let $X$ be the size
+of this aggregator's output; note that $K \leq X \leq fK$.  The aggregator's
+output can be viewed as a random sample of $X$ items without replacement from
+the key space (technically, it's a random sample from the set of distinct keys
+sent by the leaves, but that, in turn, is also a uniform random sample from the
+key space).
+
+Essentially, each aggregator applies a duplicate-elimination operation over
+its input, so $p(X = x|f, K)$ is the probability of the union of the $f$
+independent samples without replacement $x$ distinct keys.
+
+% This relates to the coupon collectors problem, but it's not exactly the
+% same.  As an analogy, our problem is like buying packs of collectible
+% cards where each individual pack contains only unique cards but two
+% different packs may contain duplicates:
+%
+% http://www.eecs.berkeley.edu/~walid/teasers/gcj-coupons.pdf
+
+If there are $N$ possible keys in the key sapce, then there are
+${N \choose K}^f$ ways to pick the distinct sets of keys.  If $X = x$, then
+the $f$ sets contained $(fK - x)$ common keys.
+
+
+\textbf{TODO: extend this to calculate the number of ways to draw that many
+        common keys and work out the probability}
+
+Thus,
 \[
-   X =
-   \left|
-        \bigcup_{a=1}^f a_{out}
-   \right|
-   ,
+    P(X = x | f, K)
+    =
+        \text{TODO}
 \]
-which is also the number of unique items picked when drawing $\sum_{a=1}^f
-|a_{out}|$ keys with replacement from the input key distribution.
-% http://math.stackexchange.com/questions/180456/proving-a-statement-on-the-probabilty-of-drawing-distinct-items
-% gives the probability distribution of X as
-% Prob(d|k,N) = (1/N^k) N!/(N−d)!S(k,d)
-% where we draw d distinct items in a sample with replacement of size k from
-% a set of size N, and S is a Stirling number of the second kind.
 
-% My own WIP on a derivation:
-
-%This can be rewritten as
-%\[
-    %X =
-    %\sum_{k=1}^{\text{num keys}}
-        %(Y_k - 1),
-%\]
-%where $Y_k = 1$ if $k$ did \emph{not} appear in the sample and $0$ otherwise.
-%We have that
-%\[
-    %P(Y_k = 1) = (1 - p(k))^K
-%\]
-
-It's interesting to note that the probability of receiving a particular key is
-the same at every level (since we never drop keys); the only thing that changes
-is the number of distinct keys observed by any reducer.  A reducer receives
-the unique keys received by its immediate parents, which is a random sample of
-the distinct keys received at its parents' level.
+Leaf nodes all take $K$ units of time.
 
 
-\textbf{TODO: I'd like to complete the above analysis, but for now it's
-interesting to look at what happens when we a distribution over the reduction
-in input size at each level:}
-
-Let $r(f)$ be the output size a reducer given that it receives $f$ inputs.
-Before, $P(r(f) = 1) = 1$.  Now, let $r(f)$ have some discrete probability
-distribution.
-
-The end-to-end aggregation time is
-\[
-    \sum_{l=1}^{\lceil\log_fm\rceil}
-        \max
-        \left(
-            |a_{out}| | a \in \text{ level } l
-        \right)
-\]
+% See also:
+% http://math.stackexchange.com/questions/131664/coupon-collector-problem-with-batched-selections
+% http://math.stackexchange.com/questions/151267/coupon-collector-problem-for-collecting-set-k-times
 
 
 \pagebreak
