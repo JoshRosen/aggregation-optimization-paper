@@ -11,6 +11,10 @@
 
 \setcounter{secnumdepth}{0} % supresss section numbers
 
+% Nice captions.
+\usepackage[hang,small,bf]{caption}
+\setlength{\captionmargin}{25pt}
+
 \title{Aggregation Optimizations for Skewed Data}
 \author{Josh Rosen}
 
@@ -38,13 +42,22 @@ case, or may achieve perfect flattening in the best case.
 
 \subsection{Analysis Framework}
 
-In our analysis, an \emph{aggregator} is a component that receives an input
+In our framework, an aggregator is a stateful operator that receives an input
 stream of (key, value) pairs and produces an output stream of (key, aggregate)
 pairs.  Let each input key $k$ be randomly sampled with replacement
 from a discrete distribution $p_{in}(k)$.  The aggregator's behavior defines
-a distribution over output sizes and output key distributions $p_{out}(k)$.
+a distribution of output sizes and output key distributions $p_{out}(k)$.
 The output key distribution is guaranteed to be at least as uniform as the
 input distribution.
+
+\begin{figure}
+\begin{center}
+    \includegraphics[width=\textwidth]{figures/aggregator_as_filter}
+\end{center}
+\caption{Aggregators can be viewed as stream filters that perform lossless
+compression by removing skew.}
+\label{fig:aggregator_as_filter}
+\end{figure}
 
 As an example, an aggregator with unlimited buffer space produces output whose
 size is equal to the number of distinct keys in its input and whose key
@@ -91,10 +104,32 @@ several problems:
 
 \end{itemize}
 
-Hierarchical aggregation may harm performance if it achieves a low reduction
-in network bandwidth. For example, a binary aggregation tree will cause
-a logarithmic increase in execution time if the intermediate aggregators
-produce output that's same size as their input.
+Hierarchical aggregation consumes more total resources than flat aggregation
+but allows parallelism to be exploited.  If the aggregation can be parallelized
+such that each aggregator makes progress by producing output that's smaller
+than its combined inputs, then hierarchical aggregation can be beneficial.
+If the individual aggregators achieve little or no reduction of their inputs,
+then hierarchical aggregation may harm performance (for example, an
+aggregation tree could cause a logarithmic increase in execution time for
+inputs that don't benefit from it).
+
+% TODO: this bit about "logarithmic increase" is confusingly-worded.
+
+% Note: the above bit about "more total resources" may depend on how we're
+% billed for those resources.  Per-operation billing is different than
+% per-second-of-wallclock-time-irrespective-of-utilization.
+
+For some inputs, it's clear whether aggregation trees will be beneficial.
+For dense numeric vectors, an aggregator with $f$ inputs produces output
+that's $1/f$ of its input size, achieving the maximum possible reduction.
+For the opposite case, imagine aggregating a set of sparse vectors with
+no common non-zero entries; in this case, aggregators perform no reduction of
+their input.
+
+In general, sparse vectors occupy a space between these two extremes: the
+degree of sparsity and skew determines whether aggregation trees are
+beneficial.  We can view sparse vectors as sets of (index, value) pairs, so we
+can analyze this problem using our aggregate-by-key framework.
 
 Given $m$ machines each producing $K$ keys, what's the optimal fan-in for an
 aggregation tree that produces a final aggregate at its root?  The maximum
@@ -127,58 +162,30 @@ where each level takes $f$ units of time to complete, for a total time of
 which is minimized by $f = e$.  Since $f$ must be discrete, the optimal fan-in
 is $f = 3$, because $3 \log_3 m \leq 2 \log_2 m$ for $m > 1$.
 
-In a more general case, the input dataset's keys could be drawn from
-a distribution $p(k)$.  The $m$ leaves of the aggregation trees draw
-independent random samples of size $K$ from this distribution.
+In a more general case, the input dataset could be a sample of $m$ random
+$K$-subsets of the keyspace (with, say, $N$ total) where we have some
+probability distribution over subsets.  Alternatively, we could imagine the
+input as $m$ random $K$-samples without replacement from the keyspace given
+a probability distribution over keys.
 
-The unconditional probability of receiving
-a particular key is the same at every level (since we never drop keys); the
-only thing that changes is the number of distinct keys observed by any
-reducer.  A reducer receives the unique keys received by its immediate
-parents, which is a random subset of the set of distinct keys received at its
-parents' level.
+To estimate the end-to-end time for an $f$-ary aggregation, we must
+estimate the sum of the maximum input sizes for leaves at each level of the
+tree.  For any subtree, the root's input size is equal to the number of
+distinct keys present at the leaves of that subtree.  Thus, the probability
+that the root of the aggregation tree receives $x$ keys as input is equal to
+the probability that the $m$ leaves have $x$ distinct keys in common.
 
-For uniformity, let each leaf node output a uniform random sample of size
-$K$ drawn from the input key distribution.  Each aggregator at the next
-level of the tree receives $f$ of these size-$K$ samples as input.  Let $X$ be the size
-of this aggregator's output; note that $K \leq X \leq fK$.  The aggregator's
-output can be viewed as a random sample of $X$ items without replacement from
-the key space (technically, it's a random sample from the set of distinct keys
-sent by the leaves, but that, in turn, is also a uniform random sample from the
-key space).
-
-Essentially, each aggregator applies a duplicate-elimination operation over
-its input, so $p(X = x|f, K)$ is the probability of the union of the $f$
-independent samples without replacement $x$ distinct keys.
-
-% This relates to the coupon collectors problem, but it's not exactly the
-% same.  As an analogy, our problem is like buying packs of collectible
-% cards where each individual pack contains only unique cards but two
-% different packs may contain duplicates:
-%
-% http://www.eecs.berkeley.edu/~walid/teasers/gcj-coupons.pdf
-
-If there are $N$ possible keys in the key sapce, then there are
-${N \choose K}^f$ ways to pick the distinct sets of keys.  If $X = x$, then
-the $f$ sets contained $(fK - x)$ common keys.
-
-
-\textbf{TODO: extend this to calculate the number of ways to draw that many
-        common keys and work out the probability}
-
-Thus,
-\[
-    P(X = x | f, K)
-    =
-        \text{TODO}
-\]
-
-Leaf nodes all take $K$ units of time.
-
-
-% See also:
-% http://math.stackexchange.com/questions/131664/coupon-collector-problem-with-batched-selections
-% http://math.stackexchange.com/questions/151267/coupon-collector-problem-for-collecting-set-k-times
+There are results for estimating the size of the union of equal-size subsets
+of a set \cite{union-of-subsets}, but unfortunately there aren't results for
+the union of different arbitray-sized subsets.
+% http://www.pnas.org/content/109/19/E1183.full#xref-ref-38-1 says that
+% this appears to be an open problem, as of 2012.
+To work around this, we can treat subtrees as independent and work with
+expected values (subtrees are dependent because their input sizes are
+conditionally dependent on their parent's input size).  Subtrees will be
+conditioned on their parents' intput sizes by imagining that their leaves'
+samples are drawn from a distribution with $x$ distinct values, but two
+subtrees at the same height will be treated as independent.
 
 
 \pagebreak
