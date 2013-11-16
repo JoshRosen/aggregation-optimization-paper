@@ -1,9 +1,7 @@
 package edu.berkeley.cs.amplab.aggregationsketches.aggregators
 
-import scalaz._
-import Scalaz._
-
 import scala.collection.mutable
+import scala.collection.immutable.TreeSet
 
 object Oracles {
   /**
@@ -16,33 +14,45 @@ object Oracles {
    * @return the total output size of a pre-aggregator that uses this oracle.
    */
   def completeLookahead[K](stream: Stream[K], bufferSize: Int): Int = {
-    val buffer = new mutable.HashSet[K]()
-    var outputSize: Int = 0
-    var z = stream.toZipper.get
-    // ^ TODO: there's got to be a way to do this without mutability,
-    // but my function programming skills are a bit too rusty for that
-    // right now; I'll come back to it later when I have more time.
-    while (!z.rights.isEmpty) {
-      val key = z.focus
-      val future = z.rights
-      if (!buffer.contains(key)) {
-        assert(buffer.size <= bufferSize)
-        if (buffer.size == bufferSize) {
-          // Evict the key whose next appearance is furthest in the future:
-          def nextUse(key: K) = if (future.contains(key)) {
-            future.indexOf(key)
-          } else {
-            Int.MaxValue
-          }
-          buffer.remove(buffer.maxBy(nextUse))
-          outputSize += 1
-        }
-        buffer.add(key)
-      }
-      z = z.next.get
+    // An index over the positions where keys occur
+    val nextKeyPositions: Map[K, mutable.Queue[Int]] =
+      stream.zipWithIndex.groupBy(_._1).mapValues(x => mutable.Queue.concat(x.map(_._2)))
+    // Track the keys currently in the buffer
+    val buffer = mutable.HashSet.empty[K]
+    // Support efficient lookup of the next key to evict:
+    var nextVictims = TreeSet.empty[(Int, K)](Ordering.by(_._1))
+    val nextVictimsInverse = mutable.HashMap.empty[K, (Int, K)]
+
+    def getNextVictim(): K = {
+      val nextVictimKey = nextVictims.firstKey._2
+      nextVictims -= nextVictims.firstKey
+      nextVictimKey
     }
-    outputSize += buffer.size
-    outputSize
+
+    def updateNextVictimsForKey(key: K, newPosition: Int) {
+      nextVictimsInverse.get(key).foreach { oldEntry =>
+        nextVictims -= oldEntry
+      }
+      val newEntry = (newPosition, key)
+      nextVictimsInverse(key) = newEntry
+      nextVictims += newEntry
+    }
+
+    var evictedTuples = 0
+
+    for (key <- stream) {
+      val nextPositionForKey = nextKeyPositions.get(key).map(_.dequeue()).getOrElse(Int.MaxValue)
+      updateNextVictimsForKey(key, nextPositionForKey)
+      if (!buffer.contains(key) && buffer.size == bufferSize) {
+        val victim = getNextVictim()
+        buffer.remove(victim)
+        evictedTuples += 1
+      }
+      updateNextVictimsForKey(key, nextKeyPositions.get(key).map(_.front).getOrElse(Int.MaxValue))
+      buffer.add(key)
+    }
+
+    evictedTuples + buffer.size
   }
 
   /**
